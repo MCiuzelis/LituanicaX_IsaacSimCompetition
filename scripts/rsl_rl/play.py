@@ -97,9 +97,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
+    # specify directory for logging experiments (absolute path, matches train.py)
+    log_root_path = os.path.join("/home/matasciuzelis/Documents/turtlebot_maze_rl", "logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
@@ -118,6 +117,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Hide wall geometry in play mode — walls are only used during training to
+    # penalise boundary contact; they serve no purpose during inference.
+    import omni.usd
+    from pxr import UsdGeom
+    _stage = omni.usd.get_context().get_stage()
+    for _wall_path in ("/World/Walls", "/World/WallsMergedMesh"):
+        _prim = _stage.GetPrimAtPath(_wall_path)
+        if _prim.IsValid():
+            UsdGeom.Imageable(_prim).MakeInvisible()
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):

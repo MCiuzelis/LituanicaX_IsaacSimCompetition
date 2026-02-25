@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import (
 @configclass
 class TurtleBotMazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env: int = 64
-    max_iterations:    int = 1000
+    max_iterations:    int = 1300
     save_interval:     int = 25
     experiment_name:   str = "turtlebot_maze"
 
