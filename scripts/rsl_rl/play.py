@@ -8,7 +8,20 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
+import subprocess
 import sys
+
+# Re-exec with conda's libstdc++ in LD_PRELOAD so the dynamic linker picks up
+# CXXABI_1.3.15 before any C extensions load.  See train.py for rationale.
+if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
+    _conda_prefix = os.environ.get("CONDA_PREFIX")
+    if _conda_prefix:
+        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
+        if os.path.exists(_libstdcpp):
+            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
+            os.environ["LD_PRELOAD"] = _libstdcpp
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 from isaaclab.app import AppLauncher
 
@@ -34,15 +47,23 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--fpv",
+    action="store_true",
+    default=False,
+    help="First-person view: force 1 env and open live Raw Camera + Cone Mask windows.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
-if args_cli.video:
+# always enable cameras to record video or for FPV mode
+if args_cli.video or args_cli.fpv:
     args_cli.enable_cameras = True
+if args_cli.fpv:
+    args_cli.num_envs = 1
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -53,10 +74,41 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import os
 import time
 
+# ── FPV display subprocess ────────────────────────────────────────────────────
+# Identical approach to visualize.py: a separate Python process with the
+# GUI-capable opencv-python loaded from the conda site-packages polls two PNG
+# files written atomically by the main process and shows them via cv2.imshow.
+_CONDA_SP = "/home/matasciuzelis/miniconda3/envs/isaac/lib/python3.11/site-packages"
+_FPV_DISPLAY_SCRIPT = rf"""
+import sys, os
+sys.path = [
+    "{_CONDA_SP}",
+    *[p for p in sys.path if "pip_prebundle" not in p and "omni" not in p],
+]
+import cv2, time, signal
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+OUT_DIR = "/tmp/mushr_debug"
+FILES = [
+    (os.path.join(OUT_DIR, "raw.png"),  "Raw Camera"),
+    (os.path.join(OUT_DIR, "mask.png"), "Cone Mask"),
+]
+while not os.path.exists(os.path.join(OUT_DIR, "raw.png")):
+    time.sleep(0.05)
+while True:
+    for fpath, name in FILES:
+        img = cv2.imread(fpath)
+        if img is not None:
+            cv2.imshow(name, img)
+    if cv2.waitKey(33) & 0xFF == ord("q"):
+        break
+cv2.destroyAllWindows()
+"""
+
+import cv2
 import gymnasium as gym
+import numpy as np
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -74,7 +126,7 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_po
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
-import turtlebot_maze_rl  # noqa: F401
+import lituanicaXsim  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -98,7 +150,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # specify directory for logging experiments (absolute path, matches train.py)
-    log_root_path = os.path.join("/home/matasciuzelis/Documents/turtlebot_maze_rl", "logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.join("/home/matasciuzelis/Documents/lituanicaXsim", "logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
@@ -184,6 +236,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # ── FPV setup ─────────────────────────────────────────────────────────────
+    _fpv_proc = None
+    _fpv_out_dir = "/tmp/mushr_debug"
+    if args_cli.fpv:
+        os.makedirs(_fpv_out_dir, exist_ok=True)
+        _mushr_env = env.unwrapped          # DirectRLEnv (MushrMazeEnv)
+        _vision    = _mushr_env._vision_processor
+        if os.environ.get("DISPLAY"):
+            _display_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            _fpv_proc = subprocess.Popen(
+                [sys.executable, "-c", _FPV_DISPLAY_SCRIPT], env=_display_env
+            )
+            print(f"[FPV] Display subprocess started (PID {_fpv_proc.pid})")
+        else:
+            print("[FPV] No $DISPLAY — writing frames to /tmp/mushr_debug/ (use feh --reload 0.25)")
+
+    def _write_atomic(path: str, img: np.ndarray) -> None:
+        base, ext = os.path.splitext(path)
+        tmp = base + "_tmp" + ext
+        cv2.imwrite(tmp, img)
+        os.replace(tmp, path)
+
+    def _fpv_step() -> None:
+        """Grab camera frame, run cone-vision pipeline, write PNGs for display."""
+        rgb = _mushr_env.camera.data.output["rgb"]          # [1, H, W, C]
+        raw_np = rgb[0].cpu().numpy()
+        if raw_np.dtype != np.uint8:
+            raw_np = raw_np.astype(np.float32)
+            if raw_np.max() <= 1.0:
+                raw_np = raw_np * 255.0
+            raw_np = np.clip(raw_np, 0, 255).astype(np.uint8)
+        if raw_np.shape[-1] > 3:
+            raw_np = raw_np[..., :3]
+
+        raw_bgr = cv2.cvtColor(raw_np, cv2.COLOR_RGB2BGR)
+        _write_atomic(os.path.join(_fpv_out_dir, "raw.png"), raw_bgr)
+
+        _, _, _, debug_imgs = _vision.process_batch(rgb, debug_env_id=0)
+        if debug_imgs is not None:
+            _write_atomic(os.path.join(_fpv_out_dir, "mask.png"), debug_imgs["mask_bgr"])
+    # ──────────────────────────────────────────────────────────────────────────
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
@@ -198,6 +292,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+        if args_cli.fpv:
+            _fpv_step()
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
@@ -211,6 +307,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # close the simulator
     env.close()
+    if args_cli.fpv and _fpv_proc is not None and _fpv_proc.poll() is None:
+        _fpv_proc.terminate()
+        _fpv_proc.wait()
 
 
 if __name__ == "__main__":

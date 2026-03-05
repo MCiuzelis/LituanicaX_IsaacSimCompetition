@@ -1,0 +1,13 @@
+15173,MarkQosNameValue,SurfaceBitDepth,8
+15173,MarkQosNameValue,EncoderInputSurfaceFormat,invalid_format
+15173,MarkQosNameValue,AllTransitSelectionValuesApplied,
+15173,MarkQosNameValue,DataChannelMode,DcSCTP
+15173,MarkQosNameValue,TransitSelectionValueApplied,0
+15173,MarkQosNameValue,AllTransitSelectionValuesForwarded,
+15173,MarkQosNameValue,TransitSelectionValueForwarded,0
+15173,MarkQos,StreamServerBackendMode is 2
+15173,MarkQos,stream 0 nvtime::sessionStartTime[us] on server: 68962493335
+15173,MarkQos,RL QOS disabled for stream: 0
+15173,MarkGsBlobStats,
+15503,MarkQos,Number of delayed commands: 0
+15503,MarkGsBlobStats,

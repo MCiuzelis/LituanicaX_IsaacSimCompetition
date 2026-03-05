@@ -4,19 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Isaac Lab reinforcement learning project training a TurtleBot3 Burger differential-drive robot to navigate a cone track using PPO. The environment uses a 2D LiDAR sensor for observations and runs inside NVIDIA Isaac Sim via the Isaac Lab framework.
+Isaac Lab reinforcement learning project training a **MuSHR nano v2** Ackermann/RC-car robot to navigate a cone track using PPO. The environment uses a front camera + OpenCV cone mask for observations and runs inside NVIDIA Isaac Sim via the Isaac Lab framework.
+
+**Registered gym task name: `Mushr`** (defined in `tasks/mushr_maze/__init__.py`)
 
 ## Commands
 
 ### Training
 ```bash
-# Can be run from any directory — log path is now hardcoded as absolute
-python /home/matasciuzelis/Documents/turtlebot_maze_rl/scripts/rsl_rl/train.py \
-    --task Isaac-TurtleBot-Maze-Direct-v0
+# Can be run from any directory — log path is hardcoded as absolute
+python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/train.py \
+    --task Mushr
 
 # Override common parameters
-python /home/matasciuzelis/Documents/turtlebot_maze_rl/scripts/rsl_rl/train.py \
-    --task Isaac-TurtleBot-Maze-Direct-v0 \
+python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/train.py \
+    --task Mushr \
     --num_envs 500 \
     --max_iterations 3000 \
     --seed 42 \
@@ -25,20 +27,32 @@ python /home/matasciuzelis/Documents/turtlebot_maze_rl/scripts/rsl_rl/train.py \
 
 ### Inference / Playback
 ```bash
-python /home/matasciuzelis/Documents/turtlebot_maze_rl/scripts/rsl_rl/play.py \
-    --task Isaac-TurtleBot-Maze-Direct-v0 \
+python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/play.py \
+    --task Mushr \
     --num_envs 1 \
-    --checkpoint /home/matasciuzelis/Documents/turtlebot_maze_rl/logs/rsl_rl/turtlebot_maze/<run_timestamp>/model_600.pt
+    --checkpoint /home/matasciuzelis/Documents/lituanicaXsim/logs/rsl_rl/mushr_maze/<run_timestamp>/model_600.pt
 ```
+
+### Camera Visualisation (no policy needed)
+```bash
+python /home/matasciuzelis/Documents/lituanicaXsim/scripts/rsl_rl/visualize.py --task Mushr
+# Optional: change upscale factor for cone-mask windows (default 5 → 480×270)
+python .../visualize.py --task Mushr --mask_scale 8
+```
+Spawns 1 env, robot stationary at start. Opens three cv2 windows:
+- **Raw Camera** — full 1152×648 RGB from Isaac Sim
+- **Cone Overlay** — 96×54 upscaled; detected cones highlighted cyan, near-field line red
+- **Cone Mask** — 96×54 upscaled binary mask (what the policy network receives)
+Press `Q` to quit.
 
 ### TensorBoard
 ```bash
-tensorboard --logdir /home/matasciuzelis/Documents/turtlebot_maze_rl/logs/rsl_rl/turtlebot_maze/
+tensorboard --logdir /home/matasciuzelis/Documents/lituanicaXsim/logs/rsl_rl/mushr_maze/
 ```
 
 ### Package Installation
 ```bash
-pip install -e /home/matasciuzelis/Documents/turtlebot_maze_rl/source/turtlebot_maze_rl
+pip install -e /home/matasciuzelis/Documents/lituanicaXsim/source/lituanicaXsim
 ```
 
 ## Architecture
@@ -47,38 +61,67 @@ pip install -e /home/matasciuzelis/Documents/turtlebot_maze_rl/source/turtlebot_
 scripts/rsl_rl/
   train.py          — Entry point: launches Isaac Sim, creates env, runs PPO via RSL-RL
   play.py           — Loads a checkpoint, runs inference, exports to JIT/ONNX
+  visualize.py      — No-policy camera viewer: raw RGB + OpenCV cone mask (cv2 windows)
   cli_args.py       — Shared argparse helpers and cfg override utilities
 
-source/turtlebot_maze_rl/turtlebot_maze_rl/
-  tasks/turtlebot_maze/
-    turtlebot_maze_env.py   — Environment and config (DirectRLEnv subclass)
+source/lituanicaXsim/lituanicaXsim/
+  tasks/mushr_maze/
+    mushr_maze_env.py       — Environment and config (DirectRLEnv subclass)
     agents/
       rsl_rl_ppo_cfg.py     — PPO runner/network/algorithm hyperparameters
+
+assets/
+  mushr_nano_v2.usd — MuSHR nano v2 robot (RC car)
+  CONES.usd         — Cone track (policy LiDAR target)
+  WALLS.usd         — Wall boundary (termination only, invisible to policy)
+  archive/          — Old/unused assets (TrackExport.usd, walls_export.usd, WheeledLab-main/, etc.)
 ```
 
-### Environment (`turtlebot_maze_env.py`)
+### Environment (`mushr_maze_env.py`)
 
 The environment is a `DirectRLEnv` (low-level Isaac Lab API, no manager hierarchy). Everything is driven by constants at the top of the file; all must be kept consistent:
 
 | Constant | Value | Used in |
 |---|---|---|
-| `LIDAR_NUM_BEAMS` | 36 | `horizontal_res=360/LIDAR_NUM_BEAMS`, `observation_space=LIDAR_NUM_BEAMS+2` |
-| `LIDAR_MAX_RANGE` | 2.5 m | `RayCasterCfg.max_distance`, observation normalization |
-| `COLLISION_DIST` | 0.13 m | cone proximity termination in `_get_dones` |
-| `WALL_CONTACT_DIST` | 0.10 m | wall proximity termination in `_get_dones` |
-| `MAX_LIN_VEL` | 0.4 m/s | action scaling, reward normalization |
-| `MAX_ANG_VEL` | 2.0 rad/s | action scaling, reward normalization |
-| `WHEEL_RADIUS` | 0.033 m | differential-drive IK in `_pre_physics_step` |
-| `HALF_SEPARATION` | 0.080 m | differential-drive IK in `_pre_physics_step` |
+| `MAX_LIN_VEL` | 2.0 m/s | action scaling, reward normalization |
+| `MAX_STEER` | 0.488 rad | action scaling (≈28°, from WheeledLab) |
+| `MAX_ANG_VEL` | 4.0 rad/s | observation normalization for yaw |
+| `WHEEL_RADIUS` | 0.05 m | Ackermann IK in `_pre_physics_step` |
+| `BASE_LENGTH` | 0.325 m | wheelbase (front–rear axle distance) |
+| `BASE_WIDTH` | 0.2 m | track width (left–right wheel distance) |
+| `CAMERA_WIDTH` | 1152 px | Pi Cam 3 Wide half-res (native 2304) |
+| `CAMERA_HEIGHT` | 648 px | Pi Cam 3 Wide half-res (native 1296) |
+| `CAMERA_HFOV_DEG` | 94° | Pi Camera Module 3 Wide actual HFOV |
+| `CONE_COLLISION_MASK_RATIO` | 0.30 | full-frame cone coverage termination |
+| `WALL_CONTACT_FORCE_THRESH` | 15.0 N | horizontal force for wall termination |
+| `action_lpf_alpha_throttle` | 0.5 | EMA alpha for throttle (τ≈47 ms at 30 Hz) |
+| `action_lpf_alpha_steer` | 0.25 | EMA alpha for steering (τ≈108 ms at 30 Hz) |
+
+Robot USD scale is **1.0** (1:1 real-world scale).
 
 **Step pipeline per policy tick (4 physics sub-steps at 120 Hz → ~30 Hz policy):**
-1. `_pre_physics_step` — normalised [lin_vel, ang_vel] → wheel velocities (rad/s) via diff-drive IK
-2. `_apply_action` — writes joint velocity targets to PhysX
+1. `_pre_physics_step` — EMA low-pass filter on actions → Ackermann IK → rear wheel ω + front steer tan position
+2. `_apply_action` — writes velocity targets (rear) + position targets (front) to PhysX
 3. Physics simulation (4×)
-4. `_get_observations` — 36 LiDAR beam distances (normalised) + body-frame lin/ang vel
+4. `_get_observations` — flattened 96×54 cone mask + body-frame lin/ang vel
 5. `_get_rewards` — alive + forward + clearance + smooth + collision + wall + completion + backward + nospin
-6. `_get_dones` — terminate if min cone-LiDAR < `COLLISION_DIST` OR min wall-LiDAR < `WALL_CONTACT_DIST`
-7. `_reset_idx` — restore default pose + env origin + ±0.2 rad yaw jitter
+6. `_get_dones` — terminate if cone mask coverage > `CONE_COLLISION_MASK_RATIO` OR wall contact force > `WALL_CONTACT_FORCE_THRESH`
+7. `_reset_idx` — restore default pose + env origin + yaw jitter + clear LPF state
+
+### Ackermann Action Model (RWD)
+
+The MuSHR nano v2 is rear-wheel drive with Ackermann steering:
+
+| Policy output | Scaling | Physical command |
+|---|---|---|
+| `action[0]` ∈ [-1,1] | × MAX_LIN_VEL | forward speed m/s |
+| `action[1]` ∈ [-1,1] | × MAX_STEER | steering angle rad |
+
+Conversion in `_pre_physics_step`:
+- `rear_wheel_ω = lin_vel / WHEEL_RADIUS` (rad/s, same for both rear wheels)
+- `steer_joint_pos = tan(steer_angle)` (tan convention matching mushr_nano_v2.usd joint definition)
+
+Front throttle joints are passive (stiffness=damping=0), suspension joints are spring-like passive (stiffness=1e8).
 
 ### Reward Terms
 
@@ -86,121 +129,99 @@ The environment is a `DirectRLEnv` (low-level Isaac Lab API, no manager hierarch
 |---|---|---|
 | `r_alive` | `alive_weight / max_episode_length` per step | Survival incentive |
 | `r_forward` | `forward_weight * (v_fwd / MAX_LIN_VEL)` | Encourage forward speed |
-| `r_clearance` | `-clearance_weight * exp(-min_ray / 0.08)` | Smooth cone-clearance penalty |
 | `r_smooth` | `-smooth_weight * |ang_vel_norm|` | Penalise erratic steering |
-| `r_collision` | `-collision_penalty` on any termination | Base death penalty (cone OR wall) |
+| `r_backward` | `-backward_weight * clamp(-v_fwd/MAX_LIN_VEL, 0, 1)` | Penalise sustained reversing |
+| `r_slip` | `-slip_weight * |rear_wheel_vel − v_fwd| / MAX_LIN_VEL` | Penalise rear-wheel traction loss |
+| `r_collision` | `-collision_penalty` on any termination | Base death penalty (cone OR wall OR flip) |
 | `r_wall` | `-wall_penalty` on wall termination only | Additional catastrophic wall penalty |
 | `r_completion` | `+completion_weight * (1 - elapsed/max_steps)` on lap | Speed bonus for lap completion |
-| `r_backward` | `-backward_weight * clamp(-v_fwd/MAX_LIN_VEL, 0)` | Penalise reversing |
 | `r_nospin` | `-nospin_weight * |ang_vel_norm| * (1 - clamp(v_fwd, 0, 1))` | Penalise spinning in place |
 
-**Reward weights (defaults in `TurtleBotMazeEnvCfg`):**
+**Disabled (weight=0):** `r_clearance` (no proximity penalty).
 
-| Parameter | Value | Notes |
-|---|---|---|
-| `alive_weight` | 1.0 | Normalised over `max_episode_length` |
-| `forward_weight` | 2.5 | |
-| `clearance_weight` | 0.5 | |
-| `smooth_weight` | 0.02 | |
-| `collision_penalty` | 5.0 | Fires on cone AND wall termination |
-| `wall_penalty` | 200.0 | Fires ONLY on wall termination (total wall cost = 205.0 vs cone cost = 5.0) |
-| `completion_weight` | 20.0 | |
-| `backward_weight` | 3.0 | |
-| `nospin_weight` | 0.5 | |
+**Reward weights (defaults in `MushrMazeEnvCfg`):**
 
-**`episode_length_s = 900.0`** — Keep this value. At 30 Hz this gives `max_episode_length = 27 000` steps, making `alive_weight/max_episode_length ≈ 0.000037` per step (meaningful). Using large values like 12 000 s makes alive reward negligible (~0.000007/step).
+| Parameter | Value |
+|---|---|
+| `alive_weight` | 1.0 |
+| `forward_weight` | 2.5 |
+| `backward_weight` | 2.0 |
+| `smooth_weight` | 0.025 |
+| `slip_weight` | 1.0 |
+| `collision_penalty` | 100.0 |
+| `wall_penalty` | 100.0 |
+| `completion_weight` | 8000.0 |
+| `nospin_weight` | 0.2 |
+
+**`episode_length_s = 900.0`** — Keep this value. At 30 Hz this gives `max_episode_length = 27 000` steps, making `alive_weight/max_episode_length ≈ 0.000037` per step (meaningful). Using large values like 12 000 s makes alive reward negligible.
 
 ### Wall System (Invisible Boundary)
 
-Walls are loaded from `walls_export.usd` and are **invisible to the policy** — the policy LiDAR only sees cones. Walls cause immediate termination + large penalty (`wall_penalty = 200`).
+Walls are loaded from `assets/WALLS.usd` and are **invisible to the policy** — the policy camera only sees cones. Walls cause immediate termination + large penalty.
 
-**Two RayCasters are used:**
-- `self.lidar` → targets `/World/TrackMergedMesh` (cones) — included in observations
-- `self.wall_lidar` → targets `/World/WallsMergedMesh` (walls) — used only for termination, never observed
+**Termination detection:**
+- **Cones:** camera-based — terminate if full-frame cone mask coverage > `CONE_COLLISION_MASK_RATIO` (0.30)
+- **Walls:** contact-force-based — terminate if horizontal force on any robot link > `WALL_CONTACT_FORCE_THRESH` (15 N)
+- **Flip/rollover:** orientation-based — terminate if robot tilt > 72° from vertical (`up_z < 0.3`)
 
-**`self._wall_terminated`** is a bool tensor set in `_get_dones` and read in `_get_rewards` to apply `wall_penalty` only on wall hits.
+Five `ContactSensor` instances monitor: `base_link`, all four wheel links.
 
 ### Multi-Robot Setup
 
-The track USD is loaded once as a **global** prim at `/World/Track` (not inside any env prim). All cone geometry is merged into a single `/World/TrackMergedMesh` prim (no CollisionAPI). Similarly, walls are merged into `/World/WallsMergedMesh`. A physics ground plane is added at `/World/GroundPlane` via `GroundPlaneCfg`. `env_spacing=0.0` keeps every env origin at world (0,0,0) so all robots spawn inside the track. Isaac Lab's per-environment collision groups prevent robot–robot interaction.
-
-**No physics collision is applied to any track or wall mesh.** See "Key Design Decisions" below.
-
-If you increase `num_envs`, no other code changes are needed. If you change `LIDAR_NUM_BEAMS`, the `horizontal_res`, `observation_space`, and the docstring beam count at the top of the file must all be updated accordingly.
-
-### RayCaster Merged Mesh
-
-Because `RayCaster` only supports one mesh prim, `_setup_scene` iterates all `UsdGeom.Mesh` prims under a root prim, transforms their vertices to world space via `UsdGeom.XformCache`, combines them into a single `Vt.Vec3fArray` / face index array, and writes the result to a new `UsdGeom.Mesh` prim. This is done for both the track (`/World/TrackMergedMesh`) and walls (`/World/WallsMergedMesh`). These prims have no `CollisionAPI` — the RayCaster reads USD geometry directly.
+Same as before: track USD is loaded once at `/World/Track`, walls at `/World/Walls`, all at world origin. `env_spacing=0.0` keeps every env origin at (0,0,0). Isaac Lab's per-environment collision groups prevent robot–robot interaction.
 
 ### PPO Configuration (`rsl_rl_ppo_cfg.py`)
 
-Actor-critic MLP: `[256, 128, 64]` with ELU activation. Rollout buffer: 64 steps × N envs. Checkpoints saved every 25 iterations.
+Actor-critic MLP: `[256, 128, 64]` with ELU activation. Rollout buffer: 64 steps × N envs. Checkpoints saved every 25 iterations. Class: `MushrMazePPORunnerCfg`.
 
 ### Log Location
 
-Logs are always written to **`/home/matasciuzelis/Documents/turtlebot_maze_rl/logs/rsl_rl/turtlebot_maze/`** (absolute path hardcoded in `train.py` line 147). This was changed from a relative path to avoid logs landing in whatever directory training was launched from.
-
-### Training Flow
-
-`train.py` uses Hydra (via `@hydra_task_config`) to load `TurtleBotMazeEnvCfg` and `TurtleBotMazePPORunnerCfg`. CLI args override Hydra defaults after parsing. The gym environment is wrapped with `RslRlVecEnvWrapper` before being passed to `OnPolicyRunner.learn()`.
-
-The task is registered as `Isaac-TurtleBot-Maze-Direct-v0` in `tasks/turtlebot_maze/__init__.py`.
+Logs are always written to **`/home/matasciuzelis/Documents/lituanicaXsim/logs/rsl_rl/mushr_maze/`** (absolute path hardcoded in `train.py` line 147, driven by `experiment_name = "mushr_maze"`).
 
 ## Asset Paths
 
-All USD paths are absolute and machine-specific — update them if moving to a different machine:
+All USD paths are absolute and machine-specific — update if moving to a different machine:
 
-- Robot: `/home/matasciuzelis/Documents/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger/turtlebot3_burger.usd`
-- Track (cones): `/home/matasciuzelis/Documents/turtlebot_maze_rl/TrackExport.usd`
-  - Scale: `(0.0075, 0.0125, 0.0075)` — X/Z = 0.75×0.01 cm→m, Y = 1.25×0.01
+- **Robot:** `/home/matasciuzelis/Documents/lituanicaXsim/assets/mushr_nano_v2.usd`
+- **Track (cones):** `/home/matasciuzelis/Documents/lituanicaXsim/assets/CONES.usd`
+  - Scale: `(0.0075, 0.0125, 0.0075)` — same CAD export convention as previous TrackExport.usd
   - Orientation: `(0.70711, 0.70711, 0.0, 0.0)` — +90° around X to cancel Y-up baked rotation
-  - Placed at world origin `(0, 0, 0)`
-  - No `CollisionAPI` on any mesh (see Key Design Decisions)
-  - RayCaster mesh: `/World/TrackMergedMesh`
-- Walls: `/home/matasciuzelis/Documents/turtlebot_maze_rl/walls_export.usd`
-  - **Same** scale and orientation as the track
-  - Loaded at `/World/Walls`; **no** `CollisionAPI`
-  - Merged into `/World/WallsMergedMesh` for the wall LiDAR
-  - Wall meshes are **not** in `TrackMergedMesh` — invisible to the policy
-- Robot spawn: `(2.989, 0.9613, 0.05)` — 5 cm above ground so wheels settle cleanly
+  - Translation: `(0, 5, 0)` — global offset
+  - **TUNE:** verify scale/orientation on first run; adjust if cones appear at wrong size/angle
+- **Walls:** `/home/matasciuzelis/Documents/lituanicaXsim/assets/WALLS.usd`
+  - Same scale, orientation, and translation as track
+  - **TUNE:** same as cones
+- **Robot spawn:** `(2.989, 5.9613, 0.05)` — **TUNE:** adjust if car spawns outside the track
 
 ## Key Design Decisions & Pitfalls
 
 ### Why no physics collision on cones OR walls?
 
-**Any form of `CollisionAPI` on these meshes causes robots to jiggle in place and not drive.** Two root causes:
+Same as before — any `CollisionAPI` on these meshes causes robots to jiggle in place:
+1. Flat base mesh at Z≈0 in `CONES.usd` fights `GroundPlaneCfg`
+2. Closed-loop wall mesh convex hull spans entire track interior
 
-1. **Flat mesh at Z≈0** — `TrackExport.usd` contains a flat base/floor element. Applying `CollisionAPI` creates a second physics surface at Z≈0 competing with `GroundPlaneCfg`.
-2. **Closed-loop mesh** — `walls_export.usd` contains a closed-loop track boundary (`/World/Walls/BézierCurve_001`, 10 720 verts, Z=[0.0004, 0.40 m]). `convexHull` on a closed loop = a hull that spans the **entire track interior** down to Z≈0 = second ground plane. A Z-extent filter does NOT help because the mesh is tall (0–0.40 m) and passes the filter.
+**Fix:** No `CollisionAPI` on any cone mesh. Walls have `CollisionAPI` so that `ContactSensor` can detect hits; cones are purely visual + detected by camera mask coverage.
 
-**Fix:** No `CollisionAPI` on any track or wall mesh. Use dedicated `RayCaster` sensors for proximity-based termination. `activate_contact_sensors=True` on the robot is not needed and must be left off.
+### Camera mounted at base_link
 
-### Why two RayCasters?
+`camera_cfg.prim_path` ends at `…/base_link/front_camera`. Offset `(0.06, 0.0, 0.04)` m places the camera ≈6 cm forward and 4 cm up from the link origin at 1:1 scale. If the view looks wrong, inspect USD link offsets and adjust `OffsetCfg.pos`.
 
-`RayCaster` raises `NotImplementedError` if given more than one mesh prim path (the track has 4 meshes, walls have 1). The merged mesh approach solves this for each sensor independently. Having two separate sensors lets the policy see cones but not walls.
+### Ackermann steering — tan joint convention
 
-### Why `mesh_prim_paths` is set in `_setup_scene` not in the config class?
-
-The actual merged prim paths only exist after the USDs are loaded and merged. Config classes hold placeholder paths (`["/World/Track"]`, `["/World/Walls"]`); `_setup_scene` overwrites them with the real paths before constructing the `RayCaster` objects.
+`mushr_nano_v2.usd` uses `tan(steering_angle)` as the steering joint position (not the angle directly). Do NOT change to raw angle without also verifying the joint definition in the USD.
 
 ### Why `env_spacing=0.0`?
 
-The track and walls are single global prims at world origin. All robots must be inside them. With non-zero spacing, env origins would offset robots outside the track and the RayCaster BVH would return max-distance readings. Isaac Lab's collision groups prevent physical robot–robot interaction.
+Track and walls are single global prims at world origin. All robots must be inside them. Non-zero spacing would offset robots outside the track.
 
 ### Wall penalty rationale
 
-At `wall_penalty = 200.0` and `collision_penalty = 5.0`:
-- Cone hit total penalty: **−5.0**
-- Wall hit total penalty: **−205.0** (collision_penalty + wall_penalty)
-- Typical accumulated forward reward over ~1300 steps ≈ **~3 250**
-- Wall death costs ~6% of total episode value — ~40× more than a cone hit
+- Cone hit total: **−100**
+- Wall hit total: **−200** (collision_penalty + wall_penalty)
 
-This makes wall contact catastrophic relative to cone contact, training the agent to navigate purely by cone geometry without ever touching the boundary.
-
-### Why `episode_length_s = 900.0` (not larger)?
-
-`alive_weight` is normalised: per-step alive reward = `alive_weight / max_episode_length`. With `episode_length_s = 12 000` → `max_episode_length = 360 000` → per-step alive reward ≈ 0.000003, effectively zero. Restoring to 900 s → 27 000 steps makes the survival incentive meaningful again (~0.000037/step).
+This makes wall contact 2× more expensive than cone contact, training the agent to stay within the boundary.
 
 ### Log path is absolute
 
-`train.py` line 147 was changed from `os.path.join("logs", ...)` (relative to CWD) to an absolute path pointing to the project directory. Previously, logs were silently written to whatever directory training was launched from (e.g., `~/logs/` when launched from home). Always check `/home/matasciuzelis/Documents/turtlebot_maze_rl/logs/` for checkpoints and TensorBoard events.
+`train.py` line 147 uses an absolute path. Logs always appear in `/home/matasciuzelis/Documents/lituanicaXsim/logs/rsl_rl/mushr_maze/`.

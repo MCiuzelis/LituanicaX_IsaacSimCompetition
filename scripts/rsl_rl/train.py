@@ -8,7 +8,22 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import sys
+
+# LD_PRELOAD must be set before any shared libraries load, which means before Python
+# itself initialises its C extensions. Setting os.environ inside an already-running
+# interpreter is too late for the current process. Re-exec with the flag in place so
+# the dynamic linker picks up conda's libstdc++ (which has CXXABI_1.3.15) on the
+# very first dlopen call.  The sentinel variable prevents infinite recursion.
+if "ISAACLAB_LIBSTDCPP_FIXED" not in os.environ:
+    _conda_prefix = os.environ.get("CONDA_PREFIX")
+    if _conda_prefix:
+        _libstdcpp = os.path.join(_conda_prefix, "lib", "libstdc++.so.6")
+        if os.path.exists(_libstdcpp):
+            os.environ["ISAACLAB_LIBSTDCPP_FIXED"] = "1"
+            os.environ["LD_PRELOAD"] = _libstdcpp
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 from isaaclab.app import AppLauncher
 
@@ -40,9 +55,8 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
+# always enable cameras — required for TiledCamera in the environment
+args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -97,7 +111,7 @@ from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
-import turtlebot_maze_rl  # noqa: F401
+import lituanicaXsim  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -144,7 +158,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.seed = seed
 
     # specify directory for logging experiments
-    log_root_path = os.path.join("/home/matasciuzelis/Documents/turtlebot_maze_rl", "logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.join("/home/matasciuzelis/Documents/lituanicaXsim", "logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs: {time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
