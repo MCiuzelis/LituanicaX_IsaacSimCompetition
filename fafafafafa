@@ -255,9 +255,9 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 # Cap velocities to prevent PhysX from launching the car on collisions.
-                max_linear_velocity=1000.0,
-                max_angular_velocity=10000.0,
-                max_depenetration_velocity=100.0,
+                max_linear_velocity=20.0,
+                max_angular_velocity=50.0,
+                max_depenetration_velocity=5.0,
                 max_contact_impulse=0.0,
                 enable_gyroscopic_forces=True,
             ),
@@ -724,6 +724,26 @@ class MushrMazeEnv(DirectRLEnv):
                 wall_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 wall_mesh_collision.GetApproximationAttr().Set("none")
 
+        # Low-restitution wall material to reduce bounce/launching on impact.
+        wall_mat_path = "/World/PhysicsMaterials/WallDamping"
+        wall_mat_prim = stage.DefinePrim(wall_mat_path, "Material")
+        UsdPhysics.MaterialAPI.Apply(wall_mat_prim)
+        phys_wall = UsdPhysics.MaterialAPI(wall_mat_prim)
+        phys_wall.CreateStaticFrictionAttr().Set(0.8)
+        phys_wall.CreateDynamicFrictionAttr().Set(0.7)
+        phys_wall.CreateRestitutionAttr().Set(0.0)
+
+        if wall_root.IsValid():
+            wall_mat = UsdShade.Material(wall_mat_prim)
+            for prim in Usd.PrimRange(wall_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                    wall_mat,
+                    UsdShade.Tokens.strongerThanDescendants,
+                    "physics",
+                )
+
         # Make walls invisible to all renderers (including the policy camera).
         # Walls exist only for contact-force termination — PhysX collision detection
         # is geometry-based and unaffected by UsdGeom visibility.
@@ -870,6 +890,14 @@ class MushrMazeEnv(DirectRLEnv):
         Steering (actions[:, 1]) ∈ [-1, 1] is still low-pass filtered to simulate
         servo bandwidth, then converted to the tan joint-position convention.
         """
+        # Zero root velocity for any agent that touched a wall last step.
+        # This prevents PhysX from continuing to fling them through the air across
+        # sub-steps after a bounce — they will be reset at the end of this step.
+        if self._wall_ever_touched.any():
+            frozen_ids = self._wall_ever_touched.nonzero(as_tuple=False).squeeze(-1)
+            zero_vel   = torch.zeros(len(frozen_ids), 6, device=self.device)
+            self.robot.write_root_velocity_to_sim(zero_vel, frozen_ids)
+
         dt = self.cfg.decimation / 120.0   # policy step duration (≈ 0.033 s at 30 Hz)
 
         # Throttle: remap [-1, 1] → [0, 1], compute acceleration rate in m/s²
@@ -893,14 +921,149 @@ class MushrMazeEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         # All 4 wheels — same velocity target (AWD, mechanically coupled)
         wheel_vels = self._rear_wheel_ang_vel.unsqueeze(-1).expand(-1, 2)  # [N, 2]
+        # If any env has touched a wall, freeze wheel velocities for the rest of the step.
+        if self._wall_ever_touched.any():
+            wheel_vels = wheel_vels.clone()
+            wheel_vels[self._wall_ever_touched] = 0.0
         self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._rear_throttle_ids)
         self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._front_throttle_ids)
 
         # Front steering — position target
         steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2)  # [N, 2]
+        if self._wall_ever_touched.any():
+            steer_positions = steer_positions.clone()
+            steer_positions[self._wall_ever_touched] = 0.0
         self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
 
+    # ------------------------------------------------------------------
+    # Contact helpers
+    # ------------------------------------------------------------------
 
+    def _contact_forces(self, sensor: ContactSensor, use_history: bool) -> torch.Tensor:
+        """Return contact forces as (N, T, B, 3) regardless of history setting."""
+        if use_history and sensor.data.net_forces_w_history is not None:
+            net_forces = sensor.data.net_forces_w_history
+        else:
+            net_forces = sensor.data.net_forces_w
+        # net_forces_w is (N, B, 3) — add time dim for uniform processing.
+        if net_forces.dim() == 3:
+            net_forces = net_forces.unsqueeze(1)
+        return net_forces
+
+    def _any_contact(
+        self,
+        sensors: dict[str, ContactSensor],
+        threshold: float,
+        *,
+        lateral_only: bool,
+        use_history: bool,
+    ) -> torch.Tensor:
+        """Returns [N] mask for any contact in sensors above threshold."""
+        contact_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for sensor in sensors.values():
+            net_forces = self._contact_forces(sensor, use_history)
+            if lateral_only:
+                magnitudes = torch.linalg.vector_norm(net_forces[..., :2], dim=-1)
+            else:
+                magnitudes = torch.linalg.vector_norm(net_forces, dim=-1)
+            has_contact = magnitudes.gt(threshold).any(dim=2).any(dim=1)
+            contact_mask |= has_contact
+        return contact_mask
+
+    def _wall_and_ramp_contact(self, *, use_history: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute wall contact (lateral) and ramp contact masks."""
+        wall_contact = self._any_contact(
+            self._wall_contact_sensors,
+            WALL_CONTACT_FORCE_THRESH,
+            lateral_only=True,
+            use_history=use_history,
+        )
+        on_ramp = self._any_contact(
+            self._ramp_contact_sensors,
+            0.1,
+            lateral_only=False,
+            use_history=use_history,
+        )
+        wall_contact &= ~on_ramp
+        return wall_contact, on_ramp
+
+    # ------------------------------------------------------------------
+    # Custom step (checks wall contact every physics sub-step)
+    # ------------------------------------------------------------------
+
+    def step(self, action: torch.Tensor):  # type: ignore[override]
+        action = action.to(self.device)
+        # add action noise
+        if self.cfg.action_noise_model:
+            action = self._action_noise_model(action)
+
+        # process actions
+        self._pre_physics_step(action)
+
+        # check if we need to do rendering within the physics loop
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+
+        # perform physics stepping
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            # set actions into buffers
+            self._apply_action()
+            # set actions into simulator
+            self.scene.write_data_to_sim()
+            # simulate
+            self.sim.step(render=False)
+            # render between steps only if the GUI or an RTX sensor needs it
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+            # update buffers at sim dt
+            self.scene.update(dt=self.physics_dt)
+
+            # Immediate wall-contact detection to freeze before the next sub-step.
+            wall_contact, _ = self._wall_and_ramp_contact(use_history=False)
+            new_contact = wall_contact & ~self._wall_ever_touched
+            if new_contact.any():
+                self._wall_ever_touched |= new_contact
+                # Freeze commanded motion so PhysX doesn't keep flinging the car.
+                self._current_vel[new_contact] = 0.0
+                self._filtered_steer[new_contact] = 0.0
+            if self._wall_ever_touched.any():
+                frozen_ids = self._wall_ever_touched.nonzero(as_tuple=False).squeeze(-1)
+                zero_vel = torch.zeros(len(frozen_ids), 6, device=self.device)
+                self.robot.write_root_velocity_to_sim(zero_vel, frozen_ids)
+
+        # post-step:
+        # -- update env counters (used for curriculum generation)
+        self.episode_length_buf += 1  # step in current episode (per env)
+        self.common_step_counter += 1  # total step (common for all envs)
+
+        self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
+        self.reset_buf = self.reset_terminated | self.reset_time_outs
+        self.reward_buf = self._get_rewards()
+
+        # -- reset envs that terminated/timed-out and log the episode information
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self._reset_idx(reset_env_ids)
+            # if sensors are added to the scene, make sure we render to reflect changes in reset
+            if self.sim.has_rtx_sensors() and self.cfg.num_rerenders_on_reset > 0:
+                for _ in range(self.cfg.num_rerenders_on_reset):
+                    self.sim.render()
+
+        # post-step: step interval event
+        if self.cfg.events:
+            if "interval" in self.event_manager.available_modes:
+                self.event_manager.apply(mode="interval", dt=self.step_dt)
+
+        # update observations
+        self.obs_buf = self._get_observations()
+
+        # add observation noise
+        # note: we apply no noise to the state space (since it is used for critic networks)
+        if self.cfg.observation_noise_model:
+            self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
+
+        # return observations, rewards, resets and extras
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     # ------------------------------------------------------------------
     # Camera cache helper (called once per step by _get_dones)
@@ -1153,27 +1316,7 @@ class MushrMazeEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # Wall collision: any lateral contact force above threshold on any robot link.
         # Ground contacts are predominantly vertical and therefore rejected.
-        wall_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for sensor in self._wall_contact_sensors.values():
-            net_forces_w = sensor.data.net_forces_w
-            lateral_force = torch.linalg.vector_norm(net_forces_w[..., :2], dim=-1).reshape(self.num_envs, -1)
-            has_contact = lateral_force.gt(WALL_CONTACT_FORCE_THRESH).any(dim=1)
-            wall_terminated |= has_contact
-
-        # Mask out envs that are currently contacting the ramp — ramp contact is normal
-        # driving behaviour and must never trigger termination.  This is the authoritative
-        # guard regardless of whether filter_prim_paths_expr works in the Isaac Lab version.
-        on_ramp = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for sensor in self._ramp_contact_sensors.values():
-            net_forces = sensor.data.net_forces_w
-            has_ramp = (
-                torch.linalg.vector_norm(net_forces, dim=-1)
-                .reshape(self.num_envs, -1)
-                .gt(0.1)
-                .any(dim=1)
-            )
-            on_ramp |= has_ramp
-        wall_terminated &= ~on_ramp
+        wall_terminated, on_ramp = self._wall_and_ramp_contact(use_history=True)
 
         # Sticky flag: once a wall is touched (and it's not a ramp), the flag stays
         # set until this env is reset.  Guarantees termination even when the bounce
@@ -1253,7 +1396,7 @@ class MushrMazeEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        SPAWN_SPEED = 1.5   # m/s
+        SPAWN_SPEED = 0   # m/s
 
         fx, fy = self.cfg.fixed_spawn_pos
         diff         = self._sector_gates - torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device)
