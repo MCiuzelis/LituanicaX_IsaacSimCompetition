@@ -126,10 +126,19 @@ class _KeyState:
             pass
 
     def get_actions(self) -> tuple[float, float]:
-        """Return (throttle, steer) in [-1, 1]."""
+        """Return (throttle, steer) in [-1, 1].
+
+        When no key is pressed throttle is -1.0 (full deceleration) so the car
+        decelerates to a stop and stays still.  W overrides to full acceleration.
+        """
         with self._lock:
-            throttle = (1.0 if "w" in self._down else 0.0) - (1.0 if "s" in self._down else 0.0)
-            steer    = (1.0 if "a" in self._down else 0.0) - (1.0 if "d" in self._down else 0.0)
+            if "w" in self._down:
+                throttle = 1.0
+            elif "s" in self._down:
+                throttle = -1.0
+            else:
+                throttle = -1.0   # no key → brake to standstill
+            steer = (1.0 if "a" in self._down else 0.0) - (1.0 if "d" in self._down else 0.0)
         return throttle, steer
 
 
@@ -241,7 +250,7 @@ def main():
             on_press=key_state.on_press, on_release=key_state.on_release
         )
         kb_listener.start()
-        print("[visualize] WASD controls active: W=accelerate  S=brake  A=left  D=right  (no key=coast)\n")
+        print("[visualize] WASD controls active: W=accelerate  S=brake  A=left  D=right  (no key=stop)\n")
     else:
         print("[visualize] pynput not found — robot stays stationary.")
         print("[visualize] Install with:  pip install pynput\n")

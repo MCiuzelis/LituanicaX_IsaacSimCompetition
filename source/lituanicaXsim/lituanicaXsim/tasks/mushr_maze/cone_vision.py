@@ -1,6 +1,7 @@
 """OpenCV cone-vision pipeline for MuSHR camera observations.
 
    RED cones with GREEN (left) and BLUE (right) stripe differentiation.
+   PURPLE ramp objects detected as a 3rd channel (no stripe classification).
 
    Key design decisions
    --------------------
@@ -96,10 +97,15 @@ class ConeVisionCfg:
     green_hsv_max: tuple[int, int, int] = (85, 255, 255)
 
     # --- BLUE stripe → RIGHT cones ---
-    # H 95-145: slightly wider to catch dark or slightly cyan-shifted blue.
+    # H 95-130: narrowed upper bound to leave room for purple ramps (130+).
     # S/V floor 50/40: more permissive for distant small cones.
     blue_hsv_min: tuple[int, int, int] = (95,  50,  40)
-    blue_hsv_max: tuple[int, int, int] = (145, 255, 255)
+    blue_hsv_max: tuple[int, int, int] = (128, 255, 255)   # slightly reduced from 130
+
+
+    # --- PURPLE → RAMP objects ---
+    purple_hsv_min: tuple[int, int, int] = (138, 130,  70) # tighter hue + higher saturation
+    purple_hsv_max: tuple[int, int, int] = (165, 255, 255)
 
 
 # ============================================================
@@ -107,10 +113,10 @@ class ConeVisionCfg:
 # ============================================================
 
 class ConeVisionProcessor:
-    """Processes RGB camera frames into LEFT/RIGHT cone masks.
+    """Processes RGB camera frames into LEFT/RIGHT cone masks plus a RAMP mask.
 
-    Output is a 2-channel observation [left_channel, right_channel], each of
-    shape (output_height, output_width), flattened and concatenated.
+    Output is a 3-channel observation [left_channel, right_channel, ramp_channel],
+    each of shape (output_height, output_width), flattened and concatenated.
     """
 
     def __init__(self, cfg: ConeVisionCfg):
@@ -133,10 +139,12 @@ class ConeVisionProcessor:
         self._red1_max  = np.array(self.cfg.red1_hsv_max,  dtype=np.uint8)
         self._red2_min  = np.array(self.cfg.red2_hsv_min,  dtype=np.uint8)
         self._red2_max  = np.array(self.cfg.red2_hsv_max,  dtype=np.uint8)
-        self._green_min = np.array(self.cfg.green_hsv_min, dtype=np.uint8)
-        self._green_max = np.array(self.cfg.green_hsv_max, dtype=np.uint8)
-        self._blue_min  = np.array(self.cfg.blue_hsv_min,  dtype=np.uint8)
-        self._blue_max  = np.array(self.cfg.blue_hsv_max,  dtype=np.uint8)
+        self._green_min  = np.array(self.cfg.green_hsv_min,  dtype=np.uint8)
+        self._green_max  = np.array(self.cfg.green_hsv_max,  dtype=np.uint8)
+        self._blue_min   = np.array(self.cfg.blue_hsv_min,   dtype=np.uint8)
+        self._blue_max   = np.array(self.cfg.blue_hsv_max,   dtype=np.uint8)
+        self._purple_min = np.array(self.cfg.purple_hsv_min, dtype=np.uint8)
+        self._purple_max = np.array(self.cfg.purple_hsv_max, dtype=np.uint8)
 
         # Noise removal: one kernel per colour mask.
         s = self.cfg.morph_open_size
@@ -156,8 +164,8 @@ class ConeVisionProcessor:
 
     @property
     def obs_size(self) -> int:
-        """Flattened observation size: 2 channels × height × width."""
-        return 2 * self.output_height * self.output_width
+        """Flattened observation size: 3 channels × height × width (left, right, ramp)."""
+        return 3 * self.output_height * self.output_width
 
     # --------------------------------------------------------
 
@@ -272,17 +280,19 @@ class ConeVisionProcessor:
         hsv = cv2.cvtColor(det_frame, cv2.COLOR_RGB2HSV)
 
         # 4. Per-colour masks
-        red_mask = cv2.bitwise_or(
-            cv2.inRange(hsv, self._red1_min, self._red1_max),
-            cv2.inRange(hsv, self._red2_min, self._red2_max),
+        red_mask    = cv2.bitwise_or(
+            cv2.inRange(hsv, self._red1_min,   self._red1_max),
+            cv2.inRange(hsv, self._red2_min,   self._red2_max),
         )
-        green_mask = cv2.inRange(hsv, self._green_min, self._green_max)
-        blue_mask  = cv2.inRange(hsv, self._blue_min,  self._blue_max)
+        green_mask  = cv2.inRange(hsv, self._green_min,  self._green_max)
+        blue_mask   = cv2.inRange(hsv, self._blue_min,   self._blue_max)
+        purple_mask = cv2.inRange(hsv, self._purple_min, self._purple_max)
 
         # 5. Noise removal on each channel
-        red_clean   = cv2.morphologyEx(red_mask,   cv2.MORPH_OPEN, self._open_k)
-        green_clean = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, self._open_k)
-        blue_clean  = cv2.morphologyEx(blue_mask,  cv2.MORPH_OPEN, self._open_k)
+        red_clean    = cv2.morphologyEx(red_mask,    cv2.MORPH_OPEN, self._open_k)
+        green_clean  = cv2.morphologyEx(green_mask,  cv2.MORPH_OPEN, self._open_k)
+        blue_clean   = cv2.morphologyEx(blue_mask,   cv2.MORPH_OPEN, self._open_k)
+        purple_clean = cv2.morphologyEx(purple_mask, cv2.MORPH_OPEN, self._open_k)
 
         # 6. Connected components on RED only
         num_labels, labels = cv2.connectedComponents(red_clean)
@@ -335,37 +345,42 @@ class ConeVisionProcessor:
             else:
                 right_det |= cone_pixels
 
-        # 8. Resize to output resolution and re-binarize
+        # 8. Resize to output resolution and re-binarize (cones + ramp)
         out_w, out_h = self.output_width, self.output_height
-        left_out  = cv2.resize(left_det,  (out_w, out_h), interpolation=cv2.INTER_AREA)
-        right_out = cv2.resize(right_det, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        left_out   = cv2.resize(left_det,    (out_w, out_h), interpolation=cv2.INTER_AREA)
+        right_out  = cv2.resize(right_det,   (out_w, out_h), interpolation=cv2.INTER_AREA)
+        ramp_out   = cv2.resize(purple_clean, (out_w, out_h), interpolation=cv2.INTER_AREA)
         _, left_out  = cv2.threshold(left_out,  64, 255, cv2.THRESH_BINARY)
         _, right_out = cv2.threshold(right_out, 64, 255, cv2.THRESH_BINARY)
+        _, ramp_out  = cv2.threshold(ramp_out,  64, 255, cv2.THRESH_BINARY)
 
-        # 9. Coverage metrics on the combined output mask
+        # 9. Coverage metrics on the combined cone output mask
         combined   = cv2.bitwise_or(left_out, right_out)
         near_row   = int((1.0 - self.cfg.near_field_fraction) * out_h)
         near_ratio = float(combined[near_row:, :].mean() / 255.0)
         coverage   = float(combined.mean() / 255.0)
 
-        # 10. Policy observation: [left_channel, right_channel] flattened
+        # 10. Policy observation: [left_channel, right_channel, ramp_channel] flattened
         obs_flat = np.stack([
             left_out.astype(np.float32)  / 255.0,
             right_out.astype(np.float32) / 255.0,
+            ramp_out.astype(np.float32)  / 255.0,
         ], axis=0).reshape(-1)
 
         # Debug visualisations at output resolution
         out_frame   = cv2.resize(det_frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
         out_bgr     = cv2.cvtColor(out_frame, cv2.COLOR_RGB2BGR)
         color_layer = out_bgr.copy()
-        color_layer[left_out  > 0] = (0,   255,   0)   # green  → left cones
-        color_layer[right_out > 0] = (255,   0,   0)   # blue   → right cones
+        color_layer[left_out  > 0] = (0,   255,   0)    # green  → left cones
+        color_layer[right_out > 0] = (255,   0,   0)    # blue   → right cones
+        color_layer[ramp_out  > 0] = (180,   0, 180)    # purple → ramps
         overlay = cv2.addWeighted(out_bgr, 0.5, color_layer, 0.5, 0.0)
         cv2.line(overlay, (0, near_row), (out_w - 1, near_row), (0, 0, 255), 1)
 
         mask_bgr = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         mask_bgr[left_out  > 0] = (0,   255,   0)
         mask_bgr[right_out > 0] = (255,   0,   0)
+        mask_bgr[ramp_out  > 0] = (180,   0, 180)
 
         return obs_flat, near_ratio, coverage, overlay, mask_bgr
 

@@ -36,9 +36,8 @@ Reward:
     +distance_weight * v_fwd * dt                             (per step, rewards physical distance covered — sums to total odometry)
     +forward_weight * (v_fwd / INITIAL_VEL_CAP)               (fixed normalisation — stable scale as curriculum advances)
     -slip_weight * |rear_wheel_vel − v_fwd| / INITIAL_VEL_CAP (traction loss penalty, same fixed normalisation)
-    -steer_weight * max(0, |steer_norm| − deadzone) / (1−dz)  (steering sharpness penalty beyond 20% deadzone)
     -wall_penalty       on wall termination only               (penalty for wall contact)
-    +completion_weight * (1 - elapsed/max_steps)              (speed bonus for lap completion)
+    +sector_gain_weight * improvement  when crossing a gate faster than global best  (sector timing reward)
 
 Termination conditions:
     - Wall contact: any lateral force on robot links above WALL_CONTACT_FORCE_THRESH (near-zero)
@@ -65,9 +64,11 @@ TUNING NOTES (first run):
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from collections import deque
+from collections.abc import Sequence
+import csv
 import math
+import os
 
 import torch
 
@@ -88,6 +89,9 @@ from isaaclab.utils.math import quat_from_euler_xyz
 
 from .cone_vision import ConeVisionCfg, ConeVisionProcessor
 
+
+#NOTES: PER LETAI PRADEDA PRACIOJ PRADZIOJ, SUSTOJA, NUOLAT SWERVINA, NERA RACING LINES
+
 # ---------------------------------------------------------------------------
 # Asset USD paths
 # ---------------------------------------------------------------------------
@@ -97,8 +101,10 @@ TRACK_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/CONES.usd"
 
 WALL_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/WALLS.usd"
 
+RAMP_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/RAMPS.usd"
+
 # ---------------------------------------------------------------------------
-# Physical constants — MuSHR nano v2 (Ackermann / RWD)
+# Physical constants — MuSHR nano v2 (Ackermann / AWD)
 # Joint names / geometry verified against mushr_nano_v2.usd (see assets/mushr_nano_v2.usd)
 # ---------------------------------------------------------------------------
 WHEEL_RADIUS    = 0.05     # m
@@ -110,25 +116,26 @@ BASE_WIDTH      = 0.2      # m  (track width between left/right wheels)
 # vel_cap starts at INITIAL_VEL_CAP and advances toward VEL_CAP_MAX as the
 # rolling mean episode return exceeds VEL_CAP_REWARD_THRESHOLD.
 # ---------------------------------------------------------------------------
-INITIAL_VEL_CAP = 2.0    # m/s — starting velocity ceiling
-VEL_CAP_MAX     = 10.0    # m/s — absolute maximum
-VEL_CAP_STEP    = 0.1   # m/s — increment per curriculum advancement
-VEL_HISTORY_LEN = 100    # completed episodes in rolling mean window
-VEL_CAP_REWARD_THRESHOLD = 500.0  # mean episode return required to advance
+INITIAL_VEL_CAP = 2 #2.5    # m/s — starting velocity ceiling
+VEL_CAP_MAX     = 6    # m/s — absolute maximum
+VEL_CAP_STEP    = 0.1  # m/s — increment per curriculum advancement
 
 # ---------------------------------------------------------------------------
-# Acceleration limits — derived from friction and rear-weight distribution.
+# Acceleration limits — AWD, full vehicle weight on all drive wheels.
 # Net ground friction (rubber wheel × basketball court, multiply combine):
 #   μ_s = 0.8, μ_d = 0.7,  g = 9.81 m/s²
-# Rear-weight fraction: ≈0.50 at rest, ≈0.40 during braking (weight transfers forward).
-#   MAX_ACCEL: μ_s × g × 0.50 ≈ 3.9  → 4.0 m/s²  (avoids rear-wheel spin-up)
-#   MAX_DECEL: μ_d × g × 0.40 ≈ 2.75 → 3.0 m/s²  (avoids rear-wheel lockup)
-# At 30 Hz (dt≈0.033 s): max Δv per step ≈ 0.13 m/s (accel) / 0.10 m/s (decel).
+# AWD: all 4 wheels driven/braked → full normal force available (no weight-fraction penalty).
+#   MAX_ACCEL: μ_s × g = 0.8 × 9.81 ≈ 7.85 → 7.8 m/s²
+#   MAX_DECEL: μ_d × g = 0.7 × 9.81 ≈ 6.87 → 6.9 m/s²
+# At 30 Hz (dt≈0.033 s): max Δv per step ≈ 0.26 m/s (accel) / 0.23 m/s (decel).
 # ---------------------------------------------------------------------------
-MAX_ACCEL = 4.0   # m/s² — max forward acceleration without wheelspin
-MAX_DECEL = 3.0   # m/s² — max deceleration without rear-wheel lockup
+MAX_ACCEL = 7.8   # m/s² — max forward acceleration (AWD, full traction)
+MAX_DECEL = 6.9   # m/s² — max deceleration (AWD, all wheels braking)
 
 MAX_STEER    = 0.488   # rad  (~28°) max steering angle
+
+# Normalization divisor for IMU angular velocity channels in the observation.
+IMU_ANG_VEL_NORM = 10.0   # rad/s — generous ceiling for fast cornering / ramp transitions
 
 # Camera capture resolution for RL training.
 # 1152×648 is half the native Pi Camera Module 3 resolution (2304×1296).
@@ -159,13 +166,13 @@ POLICY_IMAGE_HEIGHT = 144
 # Any lateral contact force above this threshold on a robot link triggers wall termination.
 # Set low so any genuine wall touch terminates immediately; ground contacts are mostly
 # vertical and therefore rejected by the lateral-force filter.
-WALL_CONTACT_FORCE_THRESH = 0.1   # N
+WALL_CONTACT_FORCE_THRESH = 0.0   # N
 
 # Slow-driving penalty and termination.
 # Any step where forward speed < SLOW_SPEED_FRACTION × vel_cap counts toward the
 # slow timer.  The timer resets to 0 the moment speed rises above the threshold.
 # Terminate if the timer reaches SLOW_TIMEOUT_STEPS (6 s × 30 Hz = 180 steps).
-SLOW_SPEED_FRACTION = 0.4    # fraction of vel_cap below which the robot is "too slow"
+SLOW_SPEED_FRACTION = 0.001 #0.1    # fraction of vel_cap below which the robot is "too slow"
 SLOW_TIMEOUT_STEPS  = 180    # 6 s × 30 Hz
 
 # Robot links monitored for wall contact.
@@ -176,6 +183,20 @@ WALL_CONTACT_LINKS = (
     "back_left_wheel_link",
     "back_right_wheel_link",
 )
+
+# ---------------------------------------------------------------------------
+# Sector gate system — centerline exported from Blender/curve_points.csv
+# ---------------------------------------------------------------------------
+# N_SECTORS is NOT hardcoded — it is read dynamically from the CSV in __init__.
+
+# Transform from CSV Blender-space XY → Isaac world XY.
+#
+# Blender and Isaac Sim use different coordinate conventions; the mapping is:
+#   X_isaac = Y_blender * -0.3 + 16.0
+#   Y_isaac = X_blender *  0.3
+# (axes are swapped, Y is negated, and a scale of 0.3 + 16 m X-offset is applied)
+SECTOR_CSV_TO_ISAAC_SCALE = 0.3
+SECTOR_CSV_TO_ISAAC_X_OFFSET = 16.0
 
 
 # ===========================================================================
@@ -195,7 +216,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # observation_space is patched in MushrMazeEnv.__init__ using ConeVisionProcessor.
     # The placeholder below keeps @configclass happy; the real value is set before
     # super().__init__() allocates observation buffers.
-    observation_space: int = 2 * POLICY_IMAGE_WIDTH * POLICY_IMAGE_HEIGHT + 1
+    observation_space: int = 3 * POLICY_IMAGE_WIDTH * POLICY_IMAGE_HEIGHT + 7  # 3 vision channels + 1 vel + 6 IMU
     state_space:       int = 0
 
     # Crop fractions are defined once in ConeVisionCfg (cone_vision.py) and used
@@ -216,7 +237,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # inside the single global Track mesh.  Isaac Lab isolates each environment
     # via collision groups so robots do not physically interact with each other.
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=16,
+        num_envs=12,
         env_spacing=0.0,
         replicate_physics=True,
     )
@@ -230,11 +251,13 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             usd_path=MUSHR_USD,
             scale=(1.0, 1.0, 1.0),
             activate_contact_sensors=True,
+            mass_props=sim_utils.MassPropertiesCfg(mass=2.0),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
-                max_linear_velocity=1000.0,
-                max_angular_velocity=100000.0,
-                max_depenetration_velocity=100.0,
+                # Cap velocities to prevent PhysX from launching the car on collisions.
+                max_linear_velocity=20.0,
+                max_angular_velocity=50.0,
+                max_depenetration_velocity=5.0,
                 max_contact_impulse=0.0,
                 enable_gyroscopic_forces=True,
             ),
@@ -248,7 +271,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             # TUNE: adjust pos after first run if car spawns outside the track
-            pos=(15.15, 5, 0.005),
+            pos=(15.15, 5, 0.002),
             joint_pos={
                 "back_left_wheel_throttle":    0.0,
                 "back_right_wheel_throttle":   0.0,
@@ -271,7 +294,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
                 velocity_limit_sim=10.0,
                 effort_limit_sim=3.2,
             ),
-            # Rear drive wheels — velocity-controlled (RWD)
+            # Rear drive wheels — velocity-controlled (AWD)
             # velocity_limit_sim / effort_limit from WheeledLab MUSHR_SUS_2WD_CFG reference.
             "rear_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["back_left_wheel_throttle", "back_right_wheel_throttle"],
@@ -280,12 +303,13 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
                 velocity_limit_sim=450.0,
                 effort_limit_sim=0.5,
             ),
-            # Front wheels — passive (no torque, free-spinning in RWD)
+            # Front drive wheels — velocity-controlled (AWD, mechanically coupled to rear)
             "front_throttle": ImplicitActuatorCfg(
                 joint_names_expr=["front_left_wheel_throttle", "front_right_wheel_throttle"],
                 stiffness=0.0,
-                damping=0.0,
-                effort_limit_sim=0.0,
+                damping=1000.0,
+                velocity_limit_sim=450.0,
+                effort_limit_sim=0.5,
             ),
         },
     )
@@ -328,52 +352,131 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Distance reward: rewards physical metres covered each step (v * dt), naturally
     # summing to total odometry over the episode.  Works correctly on a circular track
     # because it integrates incremental progress rather than straight-line displacement.
-    distance_weight:    float = 0.5   # reward per metre of forward travel
-    forward_weight:     float = 4.0
+    distance_weight:    float = 5   # reward per metre of forward travel
+    forward_weight:     float = 999
 
     # Extra one-time penalty specifically for wall contact (on top of collision_penalty).
-    wall_penalty:       float = 100
+    wall_penalty:       float = 50
 
-    # Lap completion speed bonus: scales with how quickly the lap was completed.
-    completion_weight:  float = 8000.0
-    departure_dist:     float = 2.0   # metres from spawn before "departed"
-    return_dist:        float = 2.0   # metres from spawn that counts as lap complete
+    # Sector timing reward.
+    # No reward is given until ALL sectors have been crossed at least once, building a
+    # reference lap (best time per sector seen so far).  Once the reference is set,
+    # any subsequent crossing that beats the reference time earns:
+    #   reward = sector_gain_weight * (ref_time - sector_time) / ref_time
+    sector_gain_weight: float = 50.0
+
+    # Quick-start bonus: one-time reward for quickly departing the spawn zone.
+    # Reward = start_bonus_weight * (1 - step_count / start_bonus_horizon), clamped ≥ 0.
+    # Full reward if the car leaves start_departure_dist metres from spawn in 1 step;
+    # zero if it takes start_bonus_horizon steps or more.
+    start_bonus_weight:    float = 50.0
+    start_departure_dist:  float = 2.0   # metres from spawn to count as "departed"
+    start_bonus_horizon:   int   = 90    # steps — reward linearly decays to 0 by this step
 
     # Rear-wheel slip penalty: discourages wheel-locking hard braking.
     # slip_speed = |mean_rear_wheel_tangential_vel − body_forward_vel| / MAX_LIN_VEL
-    slip_weight:        float = 1.0
+    slip_weight:        float = 4.0
 
-    # Steering sharpness penalty: linear penalty beyond a deadzone fraction of MAX_STEER.
-    # No penalty for |steer| ≤ steer_deadzone; linearly increasing above that.
-    steer_weight:    float = 0.5   # small — just suppresses constant oscillation
-    steer_deadzone:  float = 0.2   # fraction of MAX_STEER below which no penalty applies
+    # Steering oscillation penalty: high-pass filter that penalises rapid steering changes.
+    # Each step the running state is updated:
+    #   d_steer = |filtered_steer[t] - filtered_steer[t-1]|  (absolute change per step)
+    #   _steer_integral = (1 - alpha) * _steer_integral + alpha * d_steer
+    # This is an EMA of the steering *derivative* — it grows when inputs change quickly
+    # (many rapid corrections) and stays near zero when steering is held steady or
+    # adjusted only gradually.  Penalty = -steer_integral_weight * _steer_integral.
+    # alpha controls decay speed: alpha=0.3 → ~2-step half-life (fast decay when calm).
+    steer_integral_weight: float = 1   # penalty weight
+    steer_integral_alpha:  float = 0.6
+
+    # Steering magnitude penalty using a fifth-root curve.
+    # reward = steer_shape_weight * (|steer_angle| / MAX_STEER)^(1/5)
+    # The fifth root is concave — it strongly penalises even small steering angles
+    # while the penalty saturates gently at large angles.
+    # Set negative to penalise; set to 0.0 to disable.
+    steer_shape_weight: float = -5.0
+
+    # Ramp reward: per-step bonus while any robot link contacts the ramp AND forward vel > 0.
+    # Reward = ramp_reward_weight * clamp(v_fwd / INITIAL_VEL_CAP, 0, 1) per step on ramp.
+    ramp_reward_weight: float = 0
+
+    # Ramp completion reward: one-time fixed bonus for a full ramp traversal.
+    # Awarded when the agent reaches z >= ramp_top_z (while touching the ramp) and
+    # then descends back to z < ramp_ground_z (no ramp contact required on landing).
+    ramp_completion_reward: float = 45.0
+    ramp_top_z:             float = 1    # m — height threshold for "topped the ramp"
+    ramp_ground_z:          float = 0.07   # m — height threshold for "back on ground"
 
     # Slow-driving penalty: applied every step the robot is below SLOW_SPEED_FRACTION × vel_cap.
-    slow_penalty_weight: float = 2.0
+    slow_penalty_weight: float = 0 #3.0
 
-    # Spawn locations (x, y, yaw_rad).  At each reset a point is chosen uniformly at random.
-    # Add or remove entries to change how many spawn points exist.
-    spawn_locations: list = None  # set in __post_init__ via dataclass default
+    # Yaw jitter applied on top of the track tangent direction at the spawned gate (radians, uniform ±jitter)
+    init_yaw_jitter: float = 0.05
 
-    def __post_init__(self):
-        if self.spawn_locations is None:
-            self.spawn_locations = [
-                (15.15, 5.0, -1.5708),   # default single spawn — TUNE after first run
-                (9.36, -4.2, 0),
-                (12.4, 0.13, 3.14),
-                (8.39, 8.94, -1.065),
-                (12.57, 4.87, 1.92),
-            ]
-
-    # Yaw jitter applied on top of each spawn point's yaw (radians, uniform ±jitter)
-    init_yaw_jitter: float = 0.1
+    # Fixed spawn → random spawn transition.
+    # All agents spawn at fixed_spawn_pos with fixed_spawn_yaw until the rolling mean
+    # episode return (over fixed_spawn_history_len episodes) exceeds fixed_spawn_reward_threshold,
+    # after which random CSV-gate spawning is used for the rest of training.
+    fixed_spawn_pos:              tuple = (15.239, 5)   # world XY (Z taken from USD default)
+    fixed_spawn_yaw:              float = -math.pi / 2.0     # -90° = facing negative Y (track direction)
+    fixed_spawn_reward_threshold: float = 600.0              # mean episode return to unlock random spawning
+    fixed_spawn_history_len:      int   = 50                # rolling window size (episodes)
 
     # Low-pass filter (EMA) for steering — simulates servo bandwidth (~100 ms).
     # Throttle no longer uses LPF: velocity integration with MAX_ACCEL/MAX_DECEL
     # provides the same rate-limiting effect inherently.
     # alpha = 1 - exp(-dt / tau) where dt ≈ 1/30 s at 30 Hz policy.
     # alpha=0.25 → tau≈108 ms.
-    action_lpf_alpha_steer: float = 0.5     # steering EMA coefficient
+    action_lpf_alpha_steer: float = 0.25     # steering EMA coefficient
+
+
+# ===========================================================================
+# Sector gate geometry helper
+# ===========================================================================
+
+def _load_sector_gates(device: str):
+    """Load Blender/curve_points.csv and return gate tensors for sector timing.
+
+    Applies the same transform as the track USD in _setup_scene:
+        world_xy = csv_xy * SECTOR_GATE_SCALE + SECTOR_GATE_OFFSET
+
+    The number of sectors is read dynamically from the CSV (no hardcoded count).
+
+    Returns:
+        n_sectors  int            — number of sector gates (= rows in the CSV)
+        gates      [n, 2]         — world XY of each gate point
+        tangents   [n, 2]         — unit forward tangent at each gate (centred diff)
+    """
+    csv_path = os.path.join(
+        os.path.dirname(__file__),
+        "../../../../../Blender/curve_points.csv",
+    )
+    pts: list[tuple[float, float]] = []
+    with open(csv_path, newline="") as f:
+        for row in csv.reader(f):
+            row = [r.strip() for r in row if r.strip()]
+            if len(row) >= 2:
+                bx, by = float(row[0]), float(row[1])
+                # X_isaac = Y_blender * -0.3 + 16, Y_isaac = X_blender * 0.3
+                x = by * -SECTOR_CSV_TO_ISAAC_SCALE + SECTOR_CSV_TO_ISAAC_X_OFFSET
+                y = bx *  SECTOR_CSV_TO_ISAAC_SCALE
+                pts.append((x, y))
+
+    n = len(pts)
+    assert n >= 3, f"curve_points.csv must have at least 3 points, got {n}"
+    print(f"[Sector] Loaded {n} sector gates from curve_points.csv")
+
+    # Centred finite-difference tangent at each gate (wrap-around for closed loop)
+    tangents: list[tuple[float, float]] = []
+    for i in range(n):
+        px, py = pts[(i - 1) % n]
+        nx, ny = pts[(i + 1) % n]
+        dx, dy = nx - px, ny - py
+        mag = math.hypot(dx, dy)
+        tangents.append((dx / mag, dy / mag))
+
+    gates_t    = torch.tensor(pts,      dtype=torch.float32, device=device)  # [n, 2]
+    tangents_t = torch.tensor(tangents, dtype=torch.float32, device=device)  # [n, 2]
+    return n, gates_t, tangents_t
 
 
 # ===========================================================================
@@ -387,6 +490,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Must exist before super().__init__(), because DirectRLEnv.__init__()
         # invokes _setup_scene(), where these sensors are created.
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
+        self._ramp_contact_sensors: dict[str, ContactSensor] = {}
 
         # Build a temporary ConeVisionProcessor (no GPU/sim needed) to get the exact
         # output dimensions (crop fractions live in ConeVisionCfg, single source of truth).
@@ -398,14 +502,19 @@ class MushrMazeEnv(DirectRLEnv):
             )
         )
         cfg.policy_image_height = _tmp_vision.output_height
-        cfg.observation_space   = _tmp_vision.obs_size
+        # 3 vision channels (left cones, right cones, ramp) + forward vel + 6 IMU scalars
+        cfg.observation_space   = _tmp_vision.obs_size + 1 + 6
 
         super().__init__(cfg, render_mode, **kwargs)
 
-        # Rear throttle joint indices (velocity-controlled, RWD)
+        # Throttle joint indices — all 4 wheels driven (AWD)
         self._rear_throttle_ids, _ = self.robot.find_joints([
             "back_left_wheel_throttle",
             "back_right_wheel_throttle",
+        ])
+        self._front_throttle_ids, _ = self.robot.find_joints([
+            "front_left_wheel_throttle",
+            "front_right_wheel_throttle",
         ])
 
         # Front steering joint indices (position-controlled)
@@ -424,30 +533,99 @@ class MushrMazeEnv(DirectRLEnv):
 
         # Low-pass filtered steering [N] — persists across steps.
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
+        # High-pass steering penalty state: EMA of |Δsteer| per step.
+        self._steer_integral  = torch.zeros(self.num_envs, device=self.device)
+        self._prev_steer      = torch.zeros(self.num_envs, device=self.device)
+        self._steer_hp = torch.zeros(self.num_envs, device=self.device)
 
-        # Curriculum: current velocity ceiling (advances as training improves).
+        # Curriculum: current velocity ceiling.
+        # Advances whenever any agent completes a full lap at the current vel_cap.
         self._vel_cap: float = INITIAL_VEL_CAP
-        # Step counter at last vel_cap advancement — used to rate-limit to one
-        # advancement per iteration (64 policy steps).
-        self._last_curriculum_step: int = -10000
+        # Set to True (in _get_rewards) the moment any agent completes a full lap
+        # at the current vel_cap.  Consumed (and reset) in _reset_idx to advance vel_cap.
+        self._lap_at_current_vel: bool = False
 
-        # Rolling episode-return history for curriculum advancement check.
-        self._ep_return_history: deque = deque(maxlen=VEL_HISTORY_LEN)
-        # Per-env cumulative episode return (reset to 0 in _reset_idx).
+        # ── Fixed → random spawn transition ───────────────────────────────────────────
+        # Starts False; set to True once mean episode return exceeds the threshold.
+        self._random_spawn_unlocked: bool = False
+        # Accumulates reward during each active episode [N] — reset to 0 at each reset.
         self._ep_return_buf = torch.zeros(self.num_envs, device=self.device)
+        # Rolling window of completed episode returns used to compute the mean.
+        self._ep_return_history: deque = deque(
+            maxlen=self.cfg.fixed_spawn_history_len
+        )
 
-        # Spawn locations tensor [S, 3] — (x, y, yaw_rad) per spawn point.
-        _sp = cfg.spawn_locations
-        self._spawn_locs = torch.tensor(
-            [[x, y, yaw] for x, y, yaw in _sp], dtype=torch.float32, device=self.device
-        )   # [S, 3]
+        # ── Sector gate geometry (precomputed constants, shared across all envs) ──────
+        self._n_sectors, self._sector_gates, self._sector_tangents = _load_sector_gates(self.device)
+        # Print first few gates so the user can verify alignment on first run.
+        print("[Sector] First 3 world gate positions (world XY):")
+        for i in range(min(3, self._n_sectors)):
+            x, y = self._sector_gates[i].tolist()
+            print(f"  gate[{i}]: ({x:.4f}, {y:.4f})")
 
-        # Lap completion tracking
-        self._start_pos    = torch.zeros(self.num_envs, 3, device=self.device)
-        self._has_departed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # ── Sector timing state ───────────────────────────────────────────────────────
+        # Reference-lap system:
+        #   Phase 1 (reference building): track best time per sector as envs explore.
+        #              Once every sector has been crossed ≥1 time, take those best times
+        #              as the reference and switch to Phase 2.
+        #   Phase 2 (comparison): reward any crossing that beats the reference time.
+        self._sector_best_times = torch.full(
+            (self._n_sectors,), float("inf"),
+            dtype=torch.float32, device=self.device,
+        )
+        # Reference times: set once when all sectors are first covered (inf = not set yet)
+        self._sector_reference_times = torch.full(
+            (self._n_sectors,), float("inf"),
+            dtype=torch.float32, device=self.device,
+        )
+        # True once the reference lap has been established
+        self._reference_established: bool = False
+        # Per-env count of sector crossings in the current episode — resets each episode.
+        # Also reset to 0 mid-episode when the agent completes a full lap, so each lap
+        # is counted independently and the curriculum trigger fires at most once per lap.
+        self._sectors_this_ep = torch.zeros(
+            self.num_envs, dtype=torch.int32, device=self.device
+        )
+        # vel_cap that was active when each env last reset.  Curriculum only advances
+        # when an agent that was spawned at the CURRENT vel_cap completes a full lap,
+        # preventing carry-over agents from instantly chaining multiple increases.
+        self._agent_spawn_vel_cap = torch.full(
+            (self.num_envs,), INITIAL_VEL_CAP, dtype=torch.float32, device=self.device
+        )
 
-        # Wall termination flag — set in _get_dones, read in _get_rewards
+        # Per-env current sector index [N]
+        self._current_sector = torch.zeros(
+            self.num_envs, dtype=torch.int64, device=self.device
+        )
+        # Step number when each env entered its current sector [N]
+        self._sector_entry_step = torch.zeros(
+            self.num_envs, dtype=torch.int32, device=self.device
+        )
+        # Signed distance to the NEXT gate from previous step [N] — for crossing detection
+        self._sector_d_prev = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+
+        # ── Quick-start tracking ──────────────────────────────────────────────────────
+        # Spawn XY position for each env (set at reset, used for start-bonus distance check)
+        self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
+        # Whether the one-time start bonus has been given for each env this episode
+        self._start_bonus_given = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+
+        # Termination/contact flags — set in _get_dones, read in _get_rewards
         self._wall_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._on_ramp         = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # Sticky wall-contact flag: set the moment any wall force is detected, cleared
+        # only in _reset_idx.  This guarantees termination even when the bounce resolves
+        # within the decimation sub-steps and the end-of-step sensor reads zero force.
+        self._wall_ever_touched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # Ramp completion state machine [N]:
+        #   False → waiting for agent to reach ramp_top_z (while on_ramp)
+        #   True  → agent has topped the ramp; waiting for descent below ramp_ground_z
+        self._ramp_ascended = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Slow-driving detection.
         # Counts consecutive steps where forward speed < SLOW_SPEED_FRACTION × vel_cap.
@@ -498,6 +676,18 @@ class MushrMazeEnv(DirectRLEnv):
             orientation=(0.0, 0.0, 0.0, 0.0),
         )
 
+        # 2c. Load ramps — rigid static colliders, visible to the policy camera.
+        ramp_cfg = sim_utils.UsdFileCfg(
+            usd_path=RAMP_USD,
+            scale=(0.003, 0.003, 0.003),
+        )
+        ramp_cfg.func(
+            "/World/Ramps",
+            ramp_cfg,
+            translation=(16, 0.0, 0.0),
+            orientation=(0.0, 0.0, 0.0, 0.0),
+        )
+
         # 3. Configure collision approximations.
         import omni.usd
         from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
@@ -534,11 +724,43 @@ class MushrMazeEnv(DirectRLEnv):
                 wall_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 wall_mesh_collision.GetApproximationAttr().Set("none")
 
+        # Low-restitution wall material to reduce bounce/launching on impact.
+        wall_mat_path = "/World/PhysicsMaterials/WallDamping"
+        wall_mat_prim = stage.DefinePrim(wall_mat_path, "Material")
+        UsdPhysics.MaterialAPI.Apply(wall_mat_prim)
+        phys_wall = UsdPhysics.MaterialAPI(wall_mat_prim)
+        phys_wall.CreateStaticFrictionAttr().Set(0.8)
+        phys_wall.CreateDynamicFrictionAttr().Set(0.7)
+        phys_wall.CreateRestitutionAttr().Set(0.0)
+
+        if wall_root.IsValid():
+            wall_mat = UsdShade.Material(wall_mat_prim)
+            for prim in Usd.PrimRange(wall_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                    wall_mat,
+                    UsdShade.Tokens.strongerThanDescendants,
+                    "physics",
+                )
+
         # Make walls invisible to all renderers (including the policy camera).
         # Walls exist only for contact-force termination — PhysX collision detection
         # is geometry-based and unaffected by UsdGeom visibility.
         if wall_root.IsValid():
             UsdGeom.Imageable(wall_root).MakeInvisible()
+
+        # Enable triangle-mesh collision on ramp meshes so cars can drive on them.
+        # Ramps are kept VISIBLE — their purple color is a policy observation channel.
+        ramp_root = stage.GetPrimAtPath("/World/Ramps")
+        if ramp_root.IsValid():
+            for prim in Usd.PrimRange(ramp_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                ramp_collision = UsdPhysics.CollisionAPI.Apply(prim)
+                ramp_collision.GetCollisionEnabledAttr().Set(True)
+                ramp_mesh_col = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                ramp_mesh_col.GetApproximationAttr().Set("none")  # triangleMesh preserves ramp shape
 
         # Remove unsupported suspension drive gains from the imported USD joints.
         # PhysX ignores these attrs for articulation joints and spams warnings otherwise.
@@ -581,16 +803,32 @@ class MushrMazeEnv(DirectRLEnv):
 
         # 5. Register sensors.
         self.camera = TiledCamera(self.cfg.camera_cfg)
-        # Wall termination uses per-link contact-force sensing.
+        # Wall termination uses per-link contact-force sensing, filtered to walls only.
+        # Without the filter, ramp contacts would also trigger wall termination.
         for link_name in WALL_CONTACT_LINKS:
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
-                history_length=0,
+                filter_prim_paths_expr=["/World/Walls"],
+                # Track full decimation window so contacts aren't missed between sub-steps.
+                history_length=self.cfg.decimation,
                 update_period=0.0,
                 track_pose=False,
                 debug_vis=False,
             )
             self._wall_contact_sensors[link_name] = ContactSensor(sensor_cfg)
+
+        # Ramp reward uses per-link contact sensors filtered to the ramp prim.
+        for link_name in WALL_CONTACT_LINKS:
+            ramp_sensor_cfg = ContactSensorCfg(
+                prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
+                filter_prim_paths_expr=["/World/Ramps"],
+                # Track full decimation window so ramp contact isn't missed.
+                history_length=self.cfg.decimation,
+                update_period=0.0,
+                track_pose=False,
+                debug_vis=False,
+            )
+            self._ramp_contact_sensors[link_name] = ContactSensor(ramp_sensor_cfg)
 
         # Create shared rubber physics material prim (referenced after cloning)
         rubber_mat_path = "/World/PhysicsMaterials/WheelRubber"
@@ -627,6 +865,8 @@ class MushrMazeEnv(DirectRLEnv):
         self.scene.sensors["front_camera"] = self.camera
         for link_name, sensor in self._wall_contact_sensors.items():
             self.scene.sensors[f"wall_contact_{link_name}"] = sensor
+        for link_name, sensor in self._ramp_contact_sensors.items():
+            self.scene.sensors[f"ramp_contact_{link_name}"] = sensor
 
         # 8. Dome light
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -650,6 +890,14 @@ class MushrMazeEnv(DirectRLEnv):
         Steering (actions[:, 1]) ∈ [-1, 1] is still low-pass filtered to simulate
         servo bandwidth, then converted to the tan joint-position convention.
         """
+        # Zero root velocity for any agent that touched a wall last step.
+        # This prevents PhysX from continuing to fling them through the air across
+        # sub-steps after a bounce — they will be reset at the end of this step.
+        if self._wall_ever_touched.any():
+            frozen_ids = self._wall_ever_touched.nonzero(as_tuple=False).squeeze(-1)
+            zero_vel   = torch.zeros(len(frozen_ids), 6, device=self.device)
+            self.robot.write_root_velocity_to_sim(zero_vel, frozen_ids)
+
         dt = self.cfg.decimation / 120.0   # policy step duration (≈ 0.033 s at 30 Hz)
 
         # Throttle: remap [-1, 1] → [0, 1], compute acceleration rate in m/s²
@@ -671,13 +919,151 @@ class MushrMazeEnv(DirectRLEnv):
         self._steer_tan          = torch.tan(steer_ang)               # tan convention
 
     def _apply_action(self) -> None:
-        # Rear throttle — velocity target (both rear wheels same speed for open diff)
-        rear_vels = self._rear_wheel_ang_vel.unsqueeze(-1).expand(-1, 2)  # [N, 2]
-        self.robot.set_joint_velocity_target(rear_vels, joint_ids=self._rear_throttle_ids)
+        # All 4 wheels — same velocity target (AWD, mechanically coupled)
+        wheel_vels = self._rear_wheel_ang_vel.unsqueeze(-1).expand(-1, 2)  # [N, 2]
+        # If any env has touched a wall, freeze wheel velocities for the rest of the step.
+        if self._wall_ever_touched.any():
+            wheel_vels = wheel_vels.clone()
+            wheel_vels[self._wall_ever_touched] = 0.0
+        self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._rear_throttle_ids)
+        self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._front_throttle_ids)
 
-        # Front steering — position target (same angle for simplified RWD model)
+        # Front steering — position target
         steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2)  # [N, 2]
+        if self._wall_ever_touched.any():
+            steer_positions = steer_positions.clone()
+            steer_positions[self._wall_ever_touched] = 0.0
         self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
+
+    # ------------------------------------------------------------------
+    # Contact helpers
+    # ------------------------------------------------------------------
+
+    def _contact_forces(self, sensor: ContactSensor, use_history: bool) -> torch.Tensor:
+        """Return contact forces as (N, T, B, 3) regardless of history setting."""
+        if use_history and sensor.data.net_forces_w_history is not None:
+            net_forces = sensor.data.net_forces_w_history
+        else:
+            net_forces = sensor.data.net_forces_w
+        # net_forces_w is (N, B, 3) — add time dim for uniform processing.
+        if net_forces.dim() == 3:
+            net_forces = net_forces.unsqueeze(1)
+        return net_forces
+
+    def _any_contact(
+        self,
+        sensors: dict[str, ContactSensor],
+        threshold: float,
+        *,
+        lateral_only: bool,
+        use_history: bool,
+    ) -> torch.Tensor:
+        """Returns [N] mask for any contact in sensors above threshold."""
+        contact_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for sensor in sensors.values():
+            net_forces = self._contact_forces(sensor, use_history)
+            if lateral_only:
+                magnitudes = torch.linalg.vector_norm(net_forces[..., :2], dim=-1)
+            else:
+                magnitudes = torch.linalg.vector_norm(net_forces, dim=-1)
+            has_contact = magnitudes.gt(threshold).any(dim=2).any(dim=1)
+            contact_mask |= has_contact
+        return contact_mask
+
+    def _wall_and_ramp_contact(self, *, use_history: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute wall contact (lateral) and ramp contact masks."""
+        wall_contact = self._any_contact(
+            self._wall_contact_sensors,
+            WALL_CONTACT_FORCE_THRESH,
+            lateral_only=True,
+            use_history=use_history,
+        )
+        on_ramp = self._any_contact(
+            self._ramp_contact_sensors,
+            0.1,
+            lateral_only=False,
+            use_history=use_history,
+        )
+        wall_contact &= ~on_ramp
+        return wall_contact, on_ramp
+
+    # ------------------------------------------------------------------
+    # Custom step (checks wall contact every physics sub-step)
+    # ------------------------------------------------------------------
+
+    def step(self, action: torch.Tensor):  # type: ignore[override]
+        action = action.to(self.device)
+        # add action noise
+        if self.cfg.action_noise_model:
+            action = self._action_noise_model(action)
+
+        # process actions
+        self._pre_physics_step(action)
+
+        # check if we need to do rendering within the physics loop
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+
+        # perform physics stepping
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            # set actions into buffers
+            self._apply_action()
+            # set actions into simulator
+            self.scene.write_data_to_sim()
+            # simulate
+            self.sim.step(render=False)
+            # render between steps only if the GUI or an RTX sensor needs it
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+            # update buffers at sim dt
+            self.scene.update(dt=self.physics_dt)
+
+            # Immediate wall-contact detection to freeze before the next sub-step.
+            wall_contact, _ = self._wall_and_ramp_contact(use_history=False)
+            new_contact = wall_contact & ~self._wall_ever_touched
+            if new_contact.any():
+                self._wall_ever_touched |= new_contact
+                # Freeze commanded motion so PhysX doesn't keep flinging the car.
+                self._current_vel[new_contact] = 0.0
+                self._filtered_steer[new_contact] = 0.0
+            if self._wall_ever_touched.any():
+                frozen_ids = self._wall_ever_touched.nonzero(as_tuple=False).squeeze(-1)
+                zero_vel = torch.zeros(len(frozen_ids), 6, device=self.device)
+                self.robot.write_root_velocity_to_sim(zero_vel, frozen_ids)
+
+        # post-step:
+        # -- update env counters (used for curriculum generation)
+        self.episode_length_buf += 1  # step in current episode (per env)
+        self.common_step_counter += 1  # total step (common for all envs)
+
+        self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
+        self.reset_buf = self.reset_terminated | self.reset_time_outs
+        self.reward_buf = self._get_rewards()
+
+        # -- reset envs that terminated/timed-out and log the episode information
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self._reset_idx(reset_env_ids)
+            # if sensors are added to the scene, make sure we render to reflect changes in reset
+            if self.sim.has_rtx_sensors() and self.cfg.num_rerenders_on_reset > 0:
+                for _ in range(self.cfg.num_rerenders_on_reset):
+                    self.sim.render()
+
+        # post-step: step interval event
+        if self.cfg.events:
+            if "interval" in self.event_manager.available_modes:
+                self.event_manager.apply(mode="interval", dt=self.step_dt)
+
+        # update observations
+        self.obs_buf = self._get_observations()
+
+        # add observation noise
+        # note: we apply no noise to the state space (since it is used for critic networks)
+        if self.cfg.observation_noise_model:
+            self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
+
+        # return observations, rewards, resets and extras
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     # ------------------------------------------------------------------
     # Camera cache helper (called once per step by _get_dones)
@@ -711,9 +1097,20 @@ class MushrMazeEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._update_camera_cache()
 
-        lin_vel_b = self.robot.data.root_lin_vel_b[:, 0:1] / self._vel_cap   # forward, normalised by curriculum cap
+        # Forward velocity — normalised by current vel_cap (curriculum-aware)
+        lin_vel_b = self.robot.data.root_lin_vel_b[:, 0:1] / self._vel_cap   # [N, 1]
 
-        obs = torch.cat([self._camera_obs, lin_vel_b], dim=-1)
+        # IMU: angular velocity (3) + gravity direction in body frame (3)
+        # Angular velocity body frame, normalised by IMU_ANG_VEL_NORM
+        ang_vel_b = self.robot.data.root_ang_vel_b / IMU_ANG_VEL_NORM        # [N, 3]
+        # Gravity vector (world z-axis) expressed in body frame using quaternion (w,x,y,z)
+        q = self.robot.data.root_quat_w                                       # [N, 4]
+        grav_x = 2.0 * (q[:, 1] * q[:, 3] - q[:, 0] * q[:, 2])              # [N]
+        grav_y = 2.0 * (q[:, 2] * q[:, 3] + q[:, 0] * q[:, 1])              # [N]
+        grav_z = 1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])       # [N]
+        gravity_body = torch.stack([grav_x, grav_y, grav_z], dim=-1)         # [N, 3]
+
+        obs = torch.cat([self._camera_obs, lin_vel_b, ang_vel_b, gravity_body], dim=-1)
         return {"policy": obs}
 
     # ------------------------------------------------------------------
@@ -742,36 +1139,162 @@ class MushrMazeEnv(DirectRLEnv):
         # Wall termination penalty.
         r_wall = -self.cfg.wall_penalty * self._wall_terminated.float()
 
-        # Lap completion speed bonus: larger when the lap is finished quickly
-        robot_pos_xy    = self.robot.data.root_pos_w[:, :2]
-        dist_from_start = torch.norm(robot_pos_xy - self._start_pos[:, :2], dim=-1)
+        # ── Quick-start bonus ─────────────────────────────────────────────────────────
+        # One-time reward for quickly leaving the spawn zone.
+        # Decays linearly from start_bonus_weight (step 1) to 0 (step start_bonus_horizon).
+        pos_xy = self.robot.data.root_pos_w[:, :2]                          # [N, 2]
+        dist_from_spawn = torch.linalg.vector_norm(
+            pos_xy - self._spawn_pos, dim=-1
+        )
+        departed_now = (~self._start_bonus_given) & (
+            dist_from_spawn > self.cfg.start_departure_dist
+        )
+        time_fraction = (
+            self.episode_length_buf.float() / self.cfg.start_bonus_horizon
+        ).clamp(0.0, 1.0)
+        r_start = self.cfg.start_bonus_weight * departed_now.float() * (1.0 - time_fraction)
+        self._start_bonus_given |= departed_now
 
-        self._has_departed |= dist_from_start > self.cfg.departure_dist
-        lap_completed = (dist_from_start < self.cfg.return_dist) & self._has_departed
+        # ── Sector timing reward ──────────────────────────────────────────────────────
+        # Two-phase system:
+        #   Phase 1 — reference building: track the best time seen per sector as envs
+        #             explore the track.  No reward until every sector ≥ 1 crossing.
+        #   Phase 2 — comparison: reward = sector_gain_weight * (ref - time) / ref
+        #             for any crossing that beats the reference time.
+        dt_policy = self.cfg.decimation * self.cfg.sim.dt                # ≈ 0.0333 s
 
-        elapsed_fraction = self.episode_length_buf.float() / self.max_episode_length
-        r_completion = self.cfg.completion_weight * lap_completed.float() * (1.0 - elapsed_fraction)
+        next_gate = (self._current_sector + 1) % self._n_sectors          # [N]
+        gate_pts  = self._sector_gates[next_gate]                          # [N, 2]
+        gate_tan  = self._sector_tangents[next_gate]                       # [N, 2]
 
-        self._has_departed[lap_completed] = False
+        # Signed distance: positive = ahead of gate, negative = behind gate
+        d_current = ((pos_xy - gate_pts) * gate_tan).sum(dim=-1)           # [N]
 
-        # Rear-wheel slip penalty — normalised by INITIAL_VEL_CAP (fixed, same reason as r_forward).
-        rear_wheel_omega = self.robot.data.joint_vel[:, self._rear_throttle_ids]  # [N, 2] rad/s
-        rear_wheel_vel   = rear_wheel_omega.mean(dim=-1) * WHEEL_RADIUS           # [N] m/s
-        slip_speed       = torch.abs(rear_wheel_vel - lin_vel_b)                  # [N] m/s
-        r_slip           = -self.cfg.slip_weight * slip_speed / INITIAL_VEL_CAP
+        # Edge detection: negative→positive sign change = forward crossing.
+        # Also require agent to be within 1.8 m of the gate point to prevent false
+        # crossings where the tangent line intersects the track far from point n.
+        near_gate = torch.linalg.vector_norm(pos_xy - gate_pts, dim=-1) < 1.8
+        crossed   = (self._sector_d_prev <= 0.0) & (d_current > 0.0) & near_gate  # [N] bool
 
-        # Steering sharpness penalty: zero below the deadzone, linear above it.
-        # Uses the post-LPF steering command (normalised [-1,1]) so it's insensitive
-        # to the agent briefly commanding a high angle that the servo hasn't reached.
-        steer_abs    = torch.abs(self._filtered_steer)                           # [N] in [0, 1]
-        steer_excess = (steer_abs - self.cfg.steer_deadzone).clamp(min=0.0)     # [N] in [0, 0.8]
-        steer_excess_norm = steer_excess / (1.0 - self.cfg.steer_deadzone)      # [N] in [0, 1]
-        r_steer      = -self.cfg.steer_weight * steer_excess_norm
+        # Sector transit time in seconds
+        sector_time = (
+            (self.episode_length_buf - self._sector_entry_step).float() * dt_policy
+        )                                                                   # [N]
 
-        # Slow-driving penalty: penalise every step the robot moves below the speed
-        # threshold.  The timer is incremented here (same step as reward) so the
-        # penalty and the termination counter stay in sync.
-        is_slow = lin_vel_b < (SLOW_SPEED_FRACTION * self._vel_cap)
+        # Always track per-env crossing count (used for both reference and curriculum)
+        if crossed.any():
+            crossed_sectors = next_gate[crossed]                            # [K]
+            crossed_times   = sector_time[crossed]                         # [K]
+            # Update global best times
+            candidate = torch.full(
+                (self._n_sectors,), float("inf"),
+                dtype=torch.float32, device=self.device,
+            )
+            candidate.scatter_reduce_(
+                0, crossed_sectors, crossed_times,
+                reduce="amin", include_self=False,
+            )
+            torch.minimum(
+                self._sector_best_times, candidate,
+                out=self._sector_best_times,
+            )
+            self._sectors_this_ep[crossed] += 1
+            # Detect which envs just completed a full lap this step
+            lap_agents = self._sectors_this_ep >= self._n_sectors          # [N] bool
+            if lap_agents.any():
+                # Reset counters immediately so each lap fires exactly once
+                self._sectors_this_ep[lap_agents] = 0
+
+                if not self._reference_established:
+                    self._sector_reference_times = self._sector_best_times.clone()
+                    self._reference_established = True
+                    ref_mean = self._sector_reference_times.mean().item()
+                    print(
+                        f"[Sector] Reference lap established! "
+                        f"{self._n_sectors} sectors, mean ref time = {ref_mean:.2f} s"
+                    )
+
+                # Curriculum: only advance if at least one lapping agent was spawned
+                # at the current vel_cap (not a carry-over from a lower level).
+                fresh_lap = lap_agents & (self._agent_spawn_vel_cap == self._vel_cap)
+                if fresh_lap.any() and not self._lap_at_current_vel:
+                    self._lap_at_current_vel = True
+
+        if not self._reference_established:
+            r_sector = torch.zeros(self.num_envs, device=self.device)
+        else:
+            # ── Phase 2: reward crossings that beat the reference ──────────────
+            ref_time    = self._sector_reference_times[next_gate]           # [N]
+            beats_ref   = crossed & (sector_time < ref_time)               # [N] bool
+            improvement = (
+                (ref_time - sector_time) / ref_time.clamp(min=1e-6)
+            ).clamp(0.0, 1.0)
+            r_sector = self.cfg.sector_gain_weight * beats_ref.float() * improvement
+
+        # Advance sector and reset entry step for envs that just crossed a gate
+        self._current_sector[crossed]    = next_gate[crossed]
+        self._sector_entry_step[crossed] = self.episode_length_buf[crossed].int()
+        self._sector_d_prev = d_current
+
+        # ── Wheel slip penalty (AWD — all 4 wheels) ──────────────────────────────────
+        all_wheel_omega = torch.cat([
+            self.robot.data.joint_vel[:, self._rear_throttle_ids],
+            self.robot.data.joint_vel[:, self._front_throttle_ids],
+        ], dim=-1)                                                                 # [N, 4] rad/s
+        wheel_vel    = all_wheel_omega.mean(dim=-1) * WHEEL_RADIUS                # [N] m/s
+        slip_speed   = torch.abs(wheel_vel - lin_vel_b)                           # [N] m/s
+        r_slip       = -self.cfg.slip_weight * slip_speed / INITIAL_VEL_CAP
+
+        # # ── Steering oscillation penalty (high-pass) ─────────────────────────────────
+        # # d_steer = per-step absolute change in steering (rad); large when the agent
+        # # reverses or jerks the wheel quickly, near-zero on steady holds or slow sweeps.
+        # # The EMA smooths out single-frame spikes while accumulating rapid back-and-forth.
+        # d_steer = torch.abs(self._filtered_steer - self._prev_steer) * MAX_STEER  # [N] rad
+        # alpha = self.cfg.steer_integral_alpha
+        # self._steer_integral = (1.0 - alpha) * self._steer_integral + alpha * d_steer
+        # self._prev_steer = self._filtered_steer.clone()
+        # r_steer = -self.cfg.steer_integral_weight * self._steer_integral
+        x = self._filtered_steer * MAX_STEER        # x[n]
+        prev_x = self._prev_steer * MAX_STEER       # x[n-1]
+
+        # High-pass filter
+        self._steer_hp = self.cfg.steer_integral_alpha * (self._steer_hp + x - prev_x)
+
+        # store previous input
+        self._prev_steer = self._filtered_steer.clone()
+
+        # reward
+        r_steer = -self.cfg.steer_integral_weight * torch.abs(self._steer_hp)
+
+        # ── Steering magnitude penalty (fifth-root curve) ─────────────────────────────
+        # (|steer_angle| / MAX_STEER)^(1/5) is concave: penalises small angles
+        # proportionally more than a linear term while saturating toward 1 at full lock.
+        steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0)  # [N] ∈ [0, 1]
+        r_steer_shape = self.cfg.steer_shape_weight * steer_norm.pow(0.2)
+
+
+        # ── Ramp contact reward ───────────────────────────────────────────────────────
+        # _on_ramp is computed and cached in _get_dones (called before _get_rewards).
+        # Only reward if the car is properly flat on the ramp (|roll| < 5°).
+        # grav_y = Y-body component of world-up = sin(roll_angle); threshold = sin(5°).
+        q = self.robot.data.root_quat_w                                     # [N, 4] (w,x,y,z)
+        grav_y = 2.0 * (q[:, 2] * q[:, 3] + q[:, 0] * q[:, 1])            # [N]
+        # low_roll = grav_y.abs() < 0.0872                                    # sin(5°) ≈ 0.0872
+        r_ramp = self.cfg.ramp_reward_weight * self._on_ramp.float() * (lin_vel_b / INITIAL_VEL_CAP).clamp(0.0, 1.0)
+
+        # ── Ramp completion reward ────────────────────────────────────────────────────
+        # State machine: set _ramp_ascended when agent reaches ramp_top_z while on_ramp;
+        # fire one-time reward (and reset flag) when agent then drops below ramp_ground_z.
+        pos_z = self.robot.data.root_pos_w[:, 2]                            # [N]
+        topped = (~self._ramp_ascended) & self._on_ramp & (pos_z >= self.cfg.ramp_top_z)
+        self._ramp_ascended |= topped
+        landed = self._ramp_ascended & (pos_z < self.cfg.ramp_ground_z)
+        self._ramp_ascended &= ~landed                                       # reset flag
+        r_ramp_complete = self.cfg.ramp_completion_reward * landed.float()
+
+        # ── Slow-driving penalty ─────────────────────────────────────────────────────
+        # Suppressed while on the ramp — the car naturally slows on inclines.
+        is_slow = (lin_vel_b < (SLOW_SPEED_FRACTION * self._vel_cap)) & ~self._on_ramp
         self._slow_timer = torch.where(
             is_slow,
             self._slow_timer + 1,
@@ -779,11 +1302,11 @@ class MushrMazeEnv(DirectRLEnv):
         )
         r_slow = -self.cfg.slow_penalty_weight * is_slow.float()
 
-        # agent_stopped = -300.0 * (lin_vel_b < 0.1).float()
+        total = r_distance + r_forward + r_slip + r_steer + r_steer_shape + r_slow + r_wall + r_sector + r_start + r_ramp + r_ramp_complete
 
-        total = r_distance + r_forward + r_slip + r_steer + r_slow + r_wall + r_completion
-        # Accumulate per-env episode return for curriculum advancement check in _reset_idx.
-        self._ep_return_buf += total
+        # Accumulate per-episode return for fixed→random spawn threshold check.
+        self._ep_return_buf += total.detach()
+
         return total
 
     # ------------------------------------------------------------------
@@ -793,14 +1316,16 @@ class MushrMazeEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # Wall collision: any lateral contact force above threshold on any robot link.
         # Ground contacts are predominantly vertical and therefore rejected.
-        wall_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for sensor in self._wall_contact_sensors.values():
-            net_forces_w = sensor.data.net_forces_w
-            lateral_force = torch.linalg.vector_norm(net_forces_w[..., :2], dim=-1).reshape(self.num_envs, -1)
-            has_contact = lateral_force.gt(WALL_CONTACT_FORCE_THRESH).any(dim=1)
-            wall_terminated |= has_contact
+        wall_terminated, on_ramp = self._wall_and_ramp_contact(use_history=True)
+
+        # Sticky flag: once a wall is touched (and it's not a ramp), the flag stays
+        # set until this env is reset.  Guarantees termination even when the bounce
+        # resolves within the decimation window and end-of-step force reads zero.
+        self._wall_ever_touched |= wall_terminated
+        wall_terminated = self._wall_ever_touched
 
         self._wall_terminated = wall_terminated
+        self._on_ramp = on_ramp          # cache for _get_rewards (avoids duplicate sensor reads)
 
         # Flip / rollover detection.
         # The Z component of the robot's local up-axis (0,0,1) in world frame equals
@@ -821,7 +1346,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Near-stop termination: immediate termination if speed drops below 5 % of vel_cap.
         # Grace period of 30 steps (~1 s) so the car can accelerate from a standing start.
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
-        stopped = (lin_vel_b < (0.05 * self._vel_cap)) & (self.episode_length_buf > 30)
+        stopped = (lin_vel_b < (0.025 * self._vel_cap)) & (self.episode_length_buf > 30)
 
         terminated = wall_terminated | flipped | slow_terminated | stopped
         time_out   = self.episode_length_buf >= self.max_episode_length - 1
@@ -835,41 +1360,34 @@ class MushrMazeEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
 
-        # ── Curriculum advancement ────────────────────────────────────────────
-        # Log the completed episode returns for terminated envs, then check if
-        # the rolling mean has crossed the threshold for a vel_cap increase.
+        # ── Episode return history (fixed→random spawn unlock) ────────────────
+        # Append the accumulated return for each resetting env, then reset its buffer.
         for eid in env_ids:
             self._ep_return_history.append(float(self._ep_return_buf[eid].item()))
         self._ep_return_buf[env_ids] = 0.0
 
-        # Rate-limit to one vel_cap advancement per iteration (64 policy steps).
-        # _reset_idx is called once per policy step for each batch of resets, so
-        # without this guard many resets in a single iteration would each trigger
-        # the check and advance vel_cap multiple times.
-        steps_since_advance = self.common_step_counter - self._last_curriculum_step
+        # Check unlock condition once per _reset_idx call (cheap — O(1) after deque fill).
         if (
-            steps_since_advance >= 64
-            and len(self._ep_return_history) >= VEL_HISTORY_LEN // 2
-            and self._vel_cap < VEL_CAP_MAX
+            not self._random_spawn_unlocked
+            and len(self._ep_return_history) >= self.cfg.fixed_spawn_history_len
         ):
-            mean_ret = sum(self._ep_return_history) / len(self._ep_return_history)
-            # Scale threshold proportionally with vel_cap so agents must actually drive
-            # faster (not just survive at the old speed) to earn each advancement.
-            # At vel_cap=2.0: threshold=500 (baseline); at vel_cap=4.0: threshold=1000; etc.
-            scaled_threshold = VEL_CAP_REWARD_THRESHOLD * (self._vel_cap / INITIAL_VEL_CAP)
-            if mean_ret >= scaled_threshold:
-                self._vel_cap = min(self._vel_cap + VEL_CAP_STEP, VEL_CAP_MAX)
-                self._last_curriculum_step = self.common_step_counter
-                # Clear history so the next check uses only episodes collected at the
-                # new (higher) vel_cap.  Without this, stale high-return episodes keep
-                # the mean above the new threshold and advancement fires every iteration.
-                # This is safe because the scaled threshold requires agents to actually
-                # perform at the new speed level before advancing again.
-                self._ep_return_history.clear()
+            mean_return = sum(self._ep_return_history) / len(self._ep_return_history)
+            if mean_return >= self.cfg.fixed_spawn_reward_threshold:
+                self._random_spawn_unlocked = True
                 print(
-                    f"[Curriculum] vel_cap → {self._vel_cap:.2f} m/s  "
-                    f"(mean_ep_return={mean_ret:.1f}, threshold={scaled_threshold:.0f})"
+                    f"[Spawn] Random spawning UNLOCKED! "
+                    f"Mean episode return = {mean_return:.1f} >= "
+                    f"{self.cfg.fixed_spawn_reward_threshold:.1f}"
                 )
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── Curriculum advancement ────────────────────────────────────────────
+        # Advance vel_cap whenever any agent has completed a full lap at the current cap.
+        # _lap_at_current_vel is set in _get_rewards; reset it here after consuming it.
+        if self._lap_at_current_vel and self._vel_cap < VEL_CAP_MAX:
+            self._lap_at_current_vel = False
+            self._vel_cap = min(self._vel_cap + VEL_CAP_STEP, VEL_CAP_MAX)
+            print(f"[Curriculum] vel_cap → {self._vel_cap:.2f} m/s  (full lap completed)")
         # ─────────────────────────────────────────────────────────────────────
 
         super()._reset_idx(env_ids)
@@ -878,36 +1396,85 @@ class MushrMazeEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        # Pick a spawn location uniformly at random for each resetting env.
-        spawn_idx = torch.randint(0, self._spawn_locs.shape[0], (n,), device=self.device)
-        chosen    = self._spawn_locs[spawn_idx]   # [n, 3]: (x, y, yaw)
+        SPAWN_SPEED = 0   # m/s
 
-        # Override XY position (keep Z from default_root_state so suspension sits correctly)
-        default_root_state[:, 0] = chosen[:, 0]
-        default_root_state[:, 1] = chosen[:, 1]
+        fx, fy = self.cfg.fixed_spawn_pos
+        diff         = self._sector_gates - torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device)
+        fixed_nearest_gate = torch.linalg.vector_norm(diff, dim=-1).argmin()  # scalar
 
-        # Apply spawn yaw plus optional jitter
-        yaw_jitter = (torch.rand(n, device=self.device) - 0.5) * (2.0 * self.cfg.init_yaw_jitter)
-        yaw        = chosen[:, 2] + yaw_jitter
-        zeros      = torch.zeros(n, device=self.device)
+        env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)  # [n]
+
+        # Determine which of the n resetting envs get fixed vs random spawn.
+        # Phase 1 (not unlocked): all fixed.
+        # Phase 2 (unlocked):     50% fixed, 50% random CSV-gate.
+        if self._random_spawn_unlocked:
+            use_random = torch.rand(n, device=self.device) < 0.5          # [n] bool
+        else:
+            use_random = torch.zeros(n, dtype=torch.bool, device=self.device)
+
+        spawn_xy = torch.empty(n, 2, device=self.device)
+        yaw      = torch.empty(n,    device=self.device)
+
+        # ── Fixed-spawn slots ─────────────────────────────────────────────────
+        fixed_mask = ~use_random
+        if fixed_mask.any():
+            nf = fixed_mask.sum()
+            spawn_xy[fixed_mask] = torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device).expand(nf, -1)
+            yaw[fixed_mask]      = self.cfg.fixed_spawn_yaw
+            self._current_sector[env_ids_t[fixed_mask]] = fixed_nearest_gate
+
+        # ── Random CSV-gate slots ─────────────────────────────────────────────
+        if use_random.any():
+            nr       = use_random.sum()
+            gate_idx = torch.randint(0, self._n_sectors, (nr,), device=self.device)
+            spawn_xy[use_random] = self._sector_gates[gate_idx]
+            gate_tan             = self._sector_tangents[gate_idx]
+            yaw_jitter           = (torch.rand(nr, device=self.device) - 0.5) * (2.0 * self.cfg.init_yaw_jitter)
+            yaw[use_random]      = torch.atan2(gate_tan[:, 1], gate_tan[:, 0]) + yaw_jitter
+            self._current_sector[env_ids_t[use_random]] = gate_idx
+
+        default_root_state[:, 0] = spawn_xy[:, 0]
+        default_root_state[:, 1] = spawn_xy[:, 1]
+
+        zeros = torch.zeros(n, device=self.device)
         dq = quat_from_euler_xyz(zeros, zeros, yaw)
         default_root_state[:, 3:7] = dq
 
-        # Zero initial velocity
-        default_root_state[:, 7:] = 0.0
+        # Initial physics velocity along spawn heading
+        default_root_state[:, 7:]  = 0.0
+        default_root_state[:, 7]   = SPAWN_SPEED * torch.cos(yaw)   # world vx
+        default_root_state[:, 8]   = SPAWN_SPEED * torch.sin(yaw)   # world vy
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
 
-        self._start_pos[env_ids]    = default_root_state[:, :3]
-        self._has_departed[env_ids] = False
+        # ── Sector + quick-start + steering state reset ──────────────────────────────
+        self._spawn_pos[env_ids]              = spawn_xy
+        self._start_bonus_given[env_ids]      = False
+        self._sectors_this_ep[env_ids]        = 0
+        self._agent_spawn_vel_cap[env_ids]    = self._vel_cap
 
-        # Clear velocity command and steering filter for reset envs.
-        self._current_vel[env_ids]    = 0.0
+        self._sector_entry_step[env_ids] = 0  # fresh start for this episode
+
+        # Signed distance from spawn to NEXT gate, clamped ≤ 0 — prevents a false
+        # crossing on the very first step.
+        next_gate_r = (self._current_sector[env_ids] + 1) % self._n_sectors       # [n]
+        gate_pts_r  = self._sector_gates[next_gate_r]                             # [n, 2]
+        gate_tan_r  = self._sector_tangents[next_gate_r]                          # [n, 2]
+        d_init      = ((spawn_xy - gate_pts_r) * gate_tan_r).sum(dim=-1)          # [n]
+        self._sector_d_prev[env_ids] = d_init.clamp(max=0.0)
+
+        # Seed velocity command to match the initial physics velocity so the integrator
+        # doesn't immediately decelerate from 0 on the first step.
+        self._current_vel[env_ids]    = SPAWN_SPEED
         self._filtered_steer[env_ids] = 0.0
+        self._steer_integral[env_ids] = 0.0
+        self._prev_steer[env_ids]     = 0.0
 
-        # Clear slow-driving timer so the new episode starts fresh.
-        self._slow_timer[env_ids] = 0
+        # Clear slow-driving timer, ramp state, and wall-contact flag for the new episode.
+        self._slow_timer[env_ids]        = 0
+        self._ramp_ascended[env_ids]     = False
+        self._wall_ever_touched[env_ids] = False
 
         # Reset joint states
         joint_pos = self.robot.data.default_joint_pos[env_ids]
