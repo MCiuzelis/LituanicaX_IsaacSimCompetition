@@ -35,12 +35,14 @@ Actuation (Ackermann / RWD):
 Reward:
     +distance_weight * v_fwd * dt                             (per step, rewards physical distance covered — sums to total odometry)
     +forward_weight * (v_fwd / INITIAL_VEL_CAP)               (fixed normalisation — stable scale as curriculum advances)
+    +accel_reward_weight * max(accel_m_s2 / MAX_ACCEL, 0)     (per step, small bonus for forward acceleration)
+    +height_reward_weight * clamp(z / ramp_top_z, 0, 1)       (per step, higher z → more reward)
     -slip_weight * |rear_wheel_vel − v_fwd| / INITIAL_VEL_CAP (traction loss penalty, same fixed normalisation)
     -wall_penalty       on wall termination only               (penalty for wall contact)
     +sector_gain_weight * improvement  when crossing a gate faster than global best  (sector timing reward)
 
 Termination conditions:
-    - Wall contact: any lateral force on robot links above WALL_CONTACT_FORCE_THRESH (near-zero)
+    - Wall contact: any horizontal normal force on robot links above WALL_CONTACT_FORCE_THRESH
     - Robot tilt > 72° from vertical (up_z < 0.3) — catches flips and rollovers
     - Slow driving: speed < 40 % of vel_cap for every step; continuous per-step penalty
       and termination after 6 s of uninterrupted slow driving (timer resets the moment
@@ -116,7 +118,7 @@ BASE_WIDTH      = 0.2      # m  (track width between left/right wheels)
 # vel_cap starts at INITIAL_VEL_CAP and advances toward VEL_CAP_MAX as the
 # rolling mean episode return exceeds VEL_CAP_REWARD_THRESHOLD.
 # ---------------------------------------------------------------------------
-INITIAL_VEL_CAP = 2 #2.5    # m/s — starting velocity ceiling
+INITIAL_VEL_CAP = 3.5    # m/s — starting velocity ceiling
 VEL_CAP_MAX     = 6    # m/s — absolute maximum
 VEL_CAP_STEP    = 0.1  # m/s — increment per curriculum advancement
 
@@ -163,17 +165,28 @@ CAMERA_FOCAL_LENGTH_MM = CAMERA_HORIZONTAL_APERTURE_MM / (
 POLICY_IMAGE_WIDTH = 256
 POLICY_IMAGE_HEIGHT = 144
 
-# Any lateral contact force above this threshold on a robot link triggers wall termination.
-# Set low so any genuine wall touch terminates immediately; ground contacts are mostly
-# vertical and therefore rejected by the lateral-force filter.
+# Wall contact force threshold (primary detection via ContactSensor in _apply_action).
+# Sensors are filtered to /World/Walls only, so ground, ramp, and all other surfaces
+# are excluded — false positives are not a concern regardless of threshold value.
+# Low threshold is critical: a slow/glancing hit generates small horizontal force per
+# sub-step (force ≈ penetration_depth × PhysX_stiffness); with a high threshold the
+# robot "eases into" the wall for many sub-steps before detection triggers (~100 ms).
+# 0.05 N catches any genuine first-touch while staying above PhysX numerical noise.
 WALL_CONTACT_FORCE_THRESH = 0.0   # N
+
+# Backup distance threshold: if the robot drifts more than this from the nearest
+
+
+# Ramp contact detection uses a lower horizontal-force threshold so shallow ramp
+# normals are still picked up while flat-ground contacts remain filtered out.
+
 
 # Slow-driving penalty and termination.
 # Any step where forward speed < SLOW_SPEED_FRACTION × vel_cap counts toward the
 # slow timer.  The timer resets to 0 the moment speed rises above the threshold.
 # Terminate if the timer reaches SLOW_TIMEOUT_STEPS (6 s × 30 Hz = 180 steps).
-SLOW_SPEED_FRACTION = 0.001 #0.1    # fraction of vel_cap below which the robot is "too slow"
-SLOW_TIMEOUT_STEPS  = 180    # 6 s × 30 Hz
+SLOW_SPEED_FRACTION = 0.3 #0.1    # fraction of vel_cap below which the robot is "too slow"
+SLOW_TIMEOUT_STEPS  = 9999    # 6 s × 30 Hz
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -216,7 +229,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # observation_space is patched in MushrMazeEnv.__init__ using ConeVisionProcessor.
     # The placeholder below keeps @configclass happy; the real value is set before
     # super().__init__() allocates observation buffers.
-    observation_space: int = 3 * POLICY_IMAGE_WIDTH * POLICY_IMAGE_HEIGHT + 7  # 3 vision channels + 1 vel + 6 IMU
+    observation_space: int = 3 * POLICY_IMAGE_WIDTH * POLICY_IMAGE_HEIGHT + 1  # 3 vision channels + 1 vel
     state_space:       int = 0
 
     # Crop fractions are defined once in ConeVisionCfg (cone_vision.py) and used
@@ -254,11 +267,10 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=2.0),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
-                # Cap velocities to prevent PhysX from launching the car on collisions.
-                max_linear_velocity=1000.0,
-                max_angular_velocity=10000.0,
-                max_depenetration_velocity=100.0,
-                max_contact_impulse=0.0,
+                max_linear_velocity=10000.0,
+                max_angular_velocity=100000.0,
+                max_depenetration_velocity=1.0,   # low — prevents launching from penetration correction
+                max_contact_impulse=5.0,           # non-zero so ContactSensor forces register; caps Δv to 2.5 m/s
                 enable_gyroscopic_forces=True,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
@@ -271,7 +283,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             # TUNE: adjust pos after first run if car spawns outside the track
-            pos=(15.15, 5, 0.002),
+            pos=(15.15, 5, 0.02),
             joint_pos={
                 "back_left_wheel_throttle":    0.0,
                 "back_right_wheel_throttle":   0.0,
@@ -352,11 +364,11 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Distance reward: rewards physical metres covered each step (v * dt), naturally
     # summing to total odometry over the episode.  Works correctly on a circular track
     # because it integrates incremental progress rather than straight-line displacement.
-    distance_weight:    float = 5   # reward per metre of forward travel
-    forward_weight:     float = 999
+    distance_weight:    float = 3   # reward per metre of forward travel
+    forward_weight:     float = 3
 
     # Extra one-time penalty specifically for wall contact (on top of collision_penalty).
-    wall_penalty:       float = 50
+    wall_penalty:       float = 100
 
     # Sector timing reward.
     # No reward is given until ALL sectors have been crossed at least once, building a
@@ -369,13 +381,17 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Reward = start_bonus_weight * (1 - step_count / start_bonus_horizon), clamped ≥ 0.
     # Full reward if the car leaves start_departure_dist metres from spawn in 1 step;
     # zero if it takes start_bonus_horizon steps or more.
-    start_bonus_weight:    float = 50.0
+    start_bonus_weight:    float = 100.0
     start_departure_dist:  float = 2.0   # metres from spawn to count as "departed"
     start_bonus_horizon:   int   = 90    # steps — reward linearly decays to 0 by this step
 
     # Rear-wheel slip penalty: discourages wheel-locking hard braking.
     # slip_speed = |mean_rear_wheel_tangential_vel − body_forward_vel| / MAX_LIN_VEL
     slip_weight:        float = 4.0
+
+    # Forward acceleration reward: per-step bonus when commanded acceleration is positive.
+    # Reward = accel_reward_weight * clamp(accel_m_s2 / MAX_ACCEL, 0, 1).
+    accel_reward_weight: float = 0
 
     # Steering oscillation penalty: high-pass filter that penalises rapid steering changes.
     # Each step the running state is updated:
@@ -385,7 +401,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # (many rapid corrections) and stays near zero when steering is held steady or
     # adjusted only gradually.  Penalty = -steer_integral_weight * _steer_integral.
     # alpha controls decay speed: alpha=0.3 → ~2-step half-life (fast decay when calm).
-    steer_integral_weight: float = 1   # penalty weight
+    steer_integral_weight: float = 0   # penalty weight
     steer_integral_alpha:  float = 0.6
 
     # Steering magnitude penalty using a fifth-root curve.
@@ -393,7 +409,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # The fifth root is concave — it strongly penalises even small steering angles
     # while the penalty saturates gently at large angles.
     # Set negative to penalise; set to 0.0 to disable.
-    steer_shape_weight: float = -5.0
+    steer_shape_weight: float = 7
 
     # Ramp reward: per-step bonus while any robot link contacts the ramp AND forward vel > 0.
     # Reward = ramp_reward_weight * clamp(v_fwd / INITIAL_VEL_CAP, 0, 1) per step on ramp.
@@ -402,15 +418,16 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # Ramp completion reward: one-time fixed bonus for a full ramp traversal.
     # Awarded when the agent reaches z >= ramp_top_z (while touching the ramp) and
     # then descends back to z < ramp_ground_z (no ramp contact required on landing).
-    ramp_completion_reward: float = 45.0
-    ramp_top_z:             float = 1    # m — height threshold for "topped the ramp"
+    ramp_completion_reward: float = 0.0
+    ramp_top_z:             float = 1.5    # m — height threshold for "topped the ramp"
     ramp_ground_z:          float = 0.07   # m — height threshold for "back on ground"
 
-    # Slow-driving penalty: applied every step the robot is below SLOW_SPEED_FRACTION × vel_cap.
-    slow_penalty_weight: float = 0 #3.0
+    # Height reward: per-step bonus proportional to z height.
+    # Reward = height_reward_weight * clamp(z / ramp_top_z, 0, 1).
+    height_reward_weight: float = 3
 
-    # Yaw jitter applied on top of the track tangent direction at the spawned gate (radians, uniform ±jitter)
-    init_yaw_jitter: float = 0.05
+    # Slow-driving penalty: applied every step the robot is below SLOW_SPEED_FRACTION × vel_cap.
+    slow_penalty_weight: float = 2 #3.0
 
     # Fixed spawn → random spawn transition.
     # All agents spawn at fixed_spawn_pos with fixed_spawn_yaw until the rolling mean
@@ -426,7 +443,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # provides the same rate-limiting effect inherently.
     # alpha = 1 - exp(-dt / tau) where dt ≈ 1/30 s at 30 Hz policy.
     # alpha=0.25 → tau≈108 ms.
-    action_lpf_alpha_steer: float = 0.25     # steering EMA coefficient
+    action_lpf_alpha_steer: float = 0.4     # steering EMA coefficient
 
 
 # ===========================================================================
@@ -490,7 +507,6 @@ class MushrMazeEnv(DirectRLEnv):
         # Must exist before super().__init__(), because DirectRLEnv.__init__()
         # invokes _setup_scene(), where these sensors are created.
         self._wall_contact_sensors: dict[str, ContactSensor] = {}
-        self._ramp_contact_sensors: dict[str, ContactSensor] = {}
 
         # Build a temporary ConeVisionProcessor (no GPU/sim needed) to get the exact
         # output dimensions (crop fractions live in ConeVisionCfg, single source of truth).
@@ -502,8 +518,8 @@ class MushrMazeEnv(DirectRLEnv):
             )
         )
         cfg.policy_image_height = _tmp_vision.output_height
-        # 3 vision channels (left cones, right cones, ramp) + forward vel + 6 IMU scalars
-        cfg.observation_space   = _tmp_vision.obs_size + 1 + 6
+        # 3 vision channels (left cones, right cones, ramp) + forward vel
+        cfg.observation_space   = _tmp_vision.obs_size + 1
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -530,6 +546,8 @@ class MushrMazeEnv(DirectRLEnv):
         # Commanded velocity state [N] — integrated from throttle actions each step,
         # clamped to [0, vel_cap].  Sent directly to rear-wheel velocity targets.
         self._current_vel = torch.zeros(self.num_envs, device=self.device)
+        # Commanded acceleration state [N] — cached for reward shaping.
+        self._accel_m_s2 = torch.zeros(self.num_envs, device=self.device)
 
         # Low-pass filtered steering [N] — persists across steps.
         self._filtered_steer = torch.zeros(self.num_envs, device=self.device)
@@ -676,6 +694,26 @@ class MushrMazeEnv(DirectRLEnv):
             orientation=(0.0, 0.0, 0.0, 0.0),
         )
 
+        # Set convexDecomposition on wall prims.
+        # Thick wall panels decompose into small outward-facing hulls — each panel's
+        # hull has correct normals that push agents back into the track.
+        # (Zero-thickness surfaces have inverted hulls spanning the track interior.)
+        try:
+            import omni.usd
+            from pxr import UsdPhysics, Usd
+            stage = omni.usd.get_context().get_stage()
+            wall_root = stage.GetPrimAtPath("/World/Walls")
+            if wall_root.IsValid():
+                for prim in Usd.PrimRange(wall_root):
+                    if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
+                        UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Set("convexDecomposition")
+                    elif prim.HasAPI(UsdPhysics.CollisionAPI):
+                        mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                        mesh_api.GetApproximationAttr().Set("convexDecomposition")
+        except Exception as e:
+            print(f"[Wall] convexDecomposition setup failed: {e}")
+
+
         # 2c. Load ramps — rigid static colliders, visible to the policy camera.
         ramp_cfg = sim_utils.UsdFileCfg(
             usd_path=RAMP_USD,
@@ -724,6 +762,18 @@ class MushrMazeEnv(DirectRLEnv):
                 wall_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 wall_mesh_collision.GetApproximationAttr().Set("none")
 
+        # Make the wall root a single kinematic rigid body so ContactSensor can track it.
+        # CollisionAPI is on child Mesh prims (e.g. /World/Walls/WallMesh_001), NOT on
+        # the root Xform.  filter_prim_paths_expr=["/World/Walls"] therefore matched no
+        # physics body, force_matrix_w was always empty, and wall contact was never
+        # detected via the sensor.  Applying RigidBodyAPI+kinematic to the root promotes
+        # it to a PhysX rigid body; PhysX automatically aggregates all descendant
+        # CollisionAPI shapes into it.  The filter now correctly matches /World/Walls.
+        if wall_root.IsValid():
+            wall_rb = UsdPhysics.RigidBodyAPI.Apply(wall_root)
+            wall_rb.GetRigidBodyEnabledAttr().Set(True)
+            wall_rb.GetKinematicEnabledAttr().Set(True)
+
         # Make walls invisible to all renderers (including the policy camera).
         # Walls exist only for contact-force termination — PhysX collision detection
         # is geometry-based and unaffected by UsdGeom visibility.
@@ -741,6 +791,7 @@ class MushrMazeEnv(DirectRLEnv):
                 ramp_collision.GetCollisionEnabledAttr().Set(True)
                 ramp_mesh_col = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 ramp_mesh_col.GetApproximationAttr().Set("none")  # triangleMesh preserves ramp shape
+
 
         # Remove unsupported suspension drive gains from the imported USD joints.
         # PhysX ignores these attrs for articulation joints and spams warnings otherwise.
@@ -783,32 +834,18 @@ class MushrMazeEnv(DirectRLEnv):
 
         # 5. Register sensors.
         self.camera = TiledCamera(self.cfg.camera_cfg)
-        # Wall termination uses per-link contact-force sensing, filtered to walls only.
-        # Without the filter, ramp contacts would also trigger wall termination.
+        # Wall termination uses per-link contact-force sensing. We detect wall hits
+        # by horizontal normal force magnitude (ground normals are vertical).
         for link_name in WALL_CONTACT_LINKS:
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
                 filter_prim_paths_expr=["/World/Walls"],
-                # Track full decimation window so contacts aren't missed between sub-steps.
                 history_length=self.cfg.decimation,
                 update_period=0.0,
                 track_pose=False,
                 debug_vis=False,
             )
             self._wall_contact_sensors[link_name] = ContactSensor(sensor_cfg)
-
-        # Ramp reward uses per-link contact sensors filtered to the ramp prim.
-        for link_name in WALL_CONTACT_LINKS:
-            ramp_sensor_cfg = ContactSensorCfg(
-                prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
-                filter_prim_paths_expr=["/World/Ramps"],
-                # Track full decimation window so ramp contact isn't missed.
-                history_length=self.cfg.decimation,
-                update_period=0.0,
-                track_pose=False,
-                debug_vis=False,
-            )
-            self._ramp_contact_sensors[link_name] = ContactSensor(ramp_sensor_cfg)
 
         # Create shared rubber physics material prim (referenced after cloning)
         rubber_mat_path = "/World/PhysicsMaterials/WheelRubber"
@@ -845,10 +882,40 @@ class MushrMazeEnv(DirectRLEnv):
         self.scene.sensors["front_camera"] = self.camera
         for link_name, sensor in self._wall_contact_sensors.items():
             self.scene.sensors[f"wall_contact_{link_name}"] = sensor
-        for link_name, sensor in self._ramp_contact_sensors.items():
-            self.scene.sensors[f"ramp_contact_{link_name}"] = sensor
 
-        # 8. Dome light
+
+        # 8. Compute ramp world-space XY bounding box for contact masking.
+        # Used in _apply_action to suppress wall termination when the robot is
+        # within the ramp footprint — the only reliable discriminant since ramp
+        # edge impacts produce horizontal forces indistinguishable from wall hits.
+        try:
+            from pxr import UsdGeom
+            bbox_cache = UsdGeom.BBoxCache(
+                Usd.TimeCode.Default(), [UsdGeom.Tokens.default_]
+            )
+            ramp_prim = stage.GetPrimAtPath("/World/Ramps")
+            if ramp_prim.IsValid():
+                bb = bbox_cache.ComputeWorldBound(ramp_prim).GetRange()
+                margin = 1.0   # metres — covers robot half-width + ramp edge uncertainty
+                self._ramp_xy_min = torch.tensor(
+                    [bb.GetMin()[0] - margin, bb.GetMin()[1] - margin],
+                    dtype=torch.float32, device=self.device,
+                )
+                self._ramp_xy_max = torch.tensor(
+                    [bb.GetMax()[0] + margin, bb.GetMax()[1] + margin],
+                    dtype=torch.float32, device=self.device,
+                )
+                print(f"[Ramp] XY bounding box (with {margin} m margin): "
+                      f"min={self._ramp_xy_min.tolist()}  max={self._ramp_xy_max.tolist()}")
+            else:
+                self._ramp_xy_min = None
+                self._ramp_xy_max = None
+        except Exception as e:
+            print(f"[Ramp] Bounding-box computation failed: {e}")
+            self._ramp_xy_min = None
+            self._ramp_xy_max = None
+
+        # 9. Dome light
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
@@ -875,6 +942,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Throttle: remap [-1, 1] → [0, 1], compute acceleration rate in m/s²
         throttle_norm = (actions[:, 0].clamp(-1.0, 1.0) + 1.0) * 0.5   # [0, 1]
         accel_m_s2 = throttle_norm * (MAX_ACCEL + MAX_DECEL) - MAX_DECEL  # [-MAX_DECEL, +MAX_ACCEL]
+        self._accel_m_s2 = accel_m_s2
 
         # Integrate commanded velocity and clamp to [0, vel_cap]
         self._current_vel = (self._current_vel + accel_m_s2 * dt).clamp(0.0, self._vel_cap)
@@ -891,13 +959,42 @@ class MushrMazeEnv(DirectRLEnv):
         self._steer_tan          = torch.tan(steer_ang)               # tan convention
 
     def _apply_action(self) -> None:
+        # ── Sub-step wall contact detection (120 Hz, covers sub-steps 0–2) ─────────────
+        # Decimation loop order: _apply_action → write → sim.step → scene.update.
+        # At sub-step K, _apply_action reads the sensor data written by scene.update()
+        # after sub-step K-1.  So contacts from sub-step K are caught here at sub-step K+1.
+        # This covers sub-steps 0–2.  Sub-step 3 contacts (no K+1 exists) are caught by
+        # the direct sensor read inside _get_dones.
+        # Sensors are filtered to /World/Walls only via filter_prim_paths_expr,
+        # so force_matrix_w contains wall-only contact forces — ramp contacts are
+        # never included and need no masking.
+        # force_matrix_w shape: (num_envs, num_bodies_per_sensor, num_filter_bodies, 3)
+        wall_hit_now = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for sensor in self._wall_contact_sensors.values():
+            fm = sensor.data.force_matrix_w   # (N, B, M, 3) or None
+            if fm is not None:
+                h = torch.linalg.vector_norm(fm[..., :2], dim=-1)   # horizontal magnitude
+                wall_hit_now |= h.reshape(self.num_envs, -1).gt(WALL_CONTACT_FORCE_THRESH).any(dim=1)
+
+        # Update sticky flag — _reset_idx handles the actual reset.
+        self._wall_ever_touched |= wall_hit_now
+
+        # ── Action application ────────────────────────────────────────────────────────
+        # Envs that have hit a wall get zero velocity targets so the robot stops
+        # within the same 120 Hz sub-step it made contact.  This removes the up-to-33 ms
+        # gap between impact and the 30 Hz _get_dones termination — the robot is already
+        # stationary by the time the episode is formally ended.
+        wall_mask = self._wall_ever_touched  # [N] bool
+
         # All 4 wheels — same velocity target (AWD, mechanically coupled)
-        wheel_vels = self._rear_wheel_ang_vel.unsqueeze(-1).expand(-1, 2)  # [N, 2]
+        wheel_vels = self._rear_wheel_ang_vel.unsqueeze(-1).expand(-1, 2).clone()  # [N, 2]
+        wheel_vels[wall_mask] = 0.0
         self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._rear_throttle_ids)
         self.robot.set_joint_velocity_target(wheel_vels, joint_ids=self._front_throttle_ids)
 
         # Front steering — position target
-        steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2)  # [N, 2]
+        steer_positions = self._steer_tan.unsqueeze(-1).expand(-1, 2).clone()  # [N, 2]
+        steer_positions[wall_mask] = 0.0
         self.robot.set_joint_position_target(steer_positions, joint_ids=self._steer_ids)
 
 
@@ -937,17 +1034,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Forward velocity — normalised by current vel_cap (curriculum-aware)
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0:1] / self._vel_cap   # [N, 1]
 
-        # IMU: angular velocity (3) + gravity direction in body frame (3)
-        # Angular velocity body frame, normalised by IMU_ANG_VEL_NORM
-        ang_vel_b = self.robot.data.root_ang_vel_b / IMU_ANG_VEL_NORM        # [N, 3]
-        # Gravity vector (world z-axis) expressed in body frame using quaternion (w,x,y,z)
-        q = self.robot.data.root_quat_w                                       # [N, 4]
-        grav_x = 2.0 * (q[:, 1] * q[:, 3] - q[:, 0] * q[:, 2])              # [N]
-        grav_y = 2.0 * (q[:, 2] * q[:, 3] + q[:, 0] * q[:, 1])              # [N]
-        grav_z = 1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])       # [N]
-        gravity_body = torch.stack([grav_x, grav_y, grav_z], dim=-1)         # [N, 3]
-
-        obs = torch.cat([self._camera_obs, lin_vel_b, ang_vel_b, gravity_body], dim=-1)
+        obs = torch.cat([self._camera_obs, lin_vel_b], dim=-1)
         return {"policy": obs}
 
     # ------------------------------------------------------------------
@@ -1082,6 +1169,9 @@ class MushrMazeEnv(DirectRLEnv):
         slip_speed   = torch.abs(wheel_vel - lin_vel_b)                           # [N] m/s
         r_slip       = -self.cfg.slip_weight * slip_speed / INITIAL_VEL_CAP
 
+        # ── Forward acceleration reward ─────────────────────────────────────────────
+        r_accel = self.cfg.accel_reward_weight * (self._accel_m_s2 / MAX_ACCEL).clamp(min=0.0, max=1.0)
+
         # # ── Steering oscillation penalty (high-pass) ─────────────────────────────────
         # # d_steer = per-step absolute change in steering (rad); large when the agent
         # # reverses or jerks the wheel quickly, near-zero on steady holds or slow sweeps.
@@ -1106,8 +1196,8 @@ class MushrMazeEnv(DirectRLEnv):
         # ── Steering magnitude penalty (fifth-root curve) ─────────────────────────────
         # (|steer_angle| / MAX_STEER)^(1/5) is concave: penalises small angles
         # proportionally more than a linear term while saturating toward 1 at full lock.
-        steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0)  # [N] ∈ [0, 1]
-        r_steer_shape = self.cfg.steer_shape_weight * steer_norm.pow(0.2)
+        steer_norm = torch.abs(self._filtered_steer).clamp(0.0, 1.0) < 0.05
+        r_steer_shape = self.cfg.steer_shape_weight * steer_norm
 
 
         # ── Ramp contact reward ───────────────────────────────────────────────────────
@@ -1129,6 +1219,9 @@ class MushrMazeEnv(DirectRLEnv):
         self._ramp_ascended &= ~landed                                       # reset flag
         r_ramp_complete = self.cfg.ramp_completion_reward * landed.float()
 
+        # ── Height reward ────────────────────────────────────────────────────────────
+        r_height = self.cfg.height_reward_weight * (pos_z.clamp(0.0, self.cfg.ramp_top_z) / self.cfg.ramp_top_z).clamp(0.0, 1.0)
+
         # ── Slow-driving penalty ─────────────────────────────────────────────────────
         # Suppressed while on the ramp — the car naturally slows on inclines.
         is_slow = (lin_vel_b < (SLOW_SPEED_FRACTION * self._vel_cap)) & ~self._on_ramp
@@ -1139,7 +1232,21 @@ class MushrMazeEnv(DirectRLEnv):
         )
         r_slow = -self.cfg.slow_penalty_weight * is_slow.float()
 
-        total = r_distance + r_forward + r_slip + r_steer + r_steer_shape + r_slow + r_wall + r_sector + r_start + r_ramp + r_ramp_complete
+        total = (
+            r_distance
+            + r_forward
+            + r_slip
+            + r_accel
+            + r_height
+            + r_steer
+            + r_steer_shape
+            + r_slow
+            + r_wall
+            + r_sector
+            + r_start
+            + r_ramp
+            + r_ramp_complete
+        )
 
         # Accumulate per-episode return for fixed→random spawn threshold check.
         self._ep_return_buf += total.detach()
@@ -1151,38 +1258,32 @@ class MushrMazeEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # Wall collision: any lateral contact force above threshold on any robot link.
-        # Ground contacts are predominantly vertical and therefore rejected.
-        wall_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # ── Wall termination: dual detection ─────────────────────────────────────────
+        # Primary: sticky contact flag set by _apply_action every physics sub-step.
+        #   Covers contacts from sub-steps 0–2: each sub-step K's contact is stored by
+        #   scene.update() after sim.step(K), then read by _apply_action at sub-step K+1.
+        wall_terminated = self._wall_ever_touched.clone()
+
+        # Secondary: direct sensor read here in _get_dones.
+        #   The decimation loop order is: _apply_action → write → sim.step → scene.update.
+        #   After the LAST sub-step (sub-step 3), scene.update() runs and refreshes sensor
+        #   data, but there is no sub-step 4 _apply_action to consume it.  Without this
+        #   read, sub-step 3 contacts are missed until the NEXT policy step's _apply_action,
+        #   causing up to ~66 ms delay.  Reading sensors directly here closes that gap.
         for sensor in self._wall_contact_sensors.values():
-            net_forces_w = sensor.data.net_forces_w
-            lateral_force = torch.linalg.vector_norm(net_forces_w[..., :2], dim=-1).reshape(self.num_envs, -1)
-            has_contact = lateral_force.gt(WALL_CONTACT_FORCE_THRESH).any(dim=1)
-            wall_terminated |= has_contact
+            fm = sensor.data.force_matrix_w   # (N, B, M, 3) or None
+            if fm is not None:
+                h = torch.linalg.vector_norm(fm[..., :2], dim=-1)
+                wall_terminated |= h.reshape(self.num_envs, -1).gt(WALL_CONTACT_FORCE_THRESH).any(dim=1)
 
-        # Mask out envs that are currently contacting the ramp — ramp contact is normal
-        # driving behaviour and must never trigger termination.  This is the authoritative
-        # guard regardless of whether filter_prim_paths_expr works in the Isaac Lab version.
-        on_ramp = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for sensor in self._ramp_contact_sensors.values():
-            net_forces = sensor.data.net_forces_w
-            has_ramp = (
-                torch.linalg.vector_norm(net_forces, dim=-1)
-                .reshape(self.num_envs, -1)
-                .gt(0.1)
-                .any(dim=1)
-            )
-            on_ramp |= has_ramp
-        wall_terminated &= ~on_ramp
+        # Ramp detection via Z position — reliable and sensor-filter-independent.
+        # Flat ground z ~ 0.02 m; ramp raises robot above ramp_ground_z immediately.
+        self._on_ramp = self.robot.data.root_pos_w[:, 2] >= self.cfg.ramp_ground_z
 
-        # Sticky flag: once a wall is touched (and it's not a ramp), the flag stays
-        # set until this env is reset.  Guarantees termination even when the bounce
-        # resolves within the decimation window and end-of-step force reads zero.
+        # Sticky flag persists until _reset_idx clears it.
         self._wall_ever_touched |= wall_terminated
         wall_terminated = self._wall_ever_touched
-
         self._wall_terminated = wall_terminated
-        self._on_ramp = on_ramp          # cache for _get_rewards (avoids duplicate sensor reads)
 
         # Flip / rollover detection.
         # The Z component of the robot's local up-axis (0,0,1) in world frame equals
@@ -1203,7 +1304,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Near-stop termination: immediate termination if speed drops below 5 % of vel_cap.
         # Grace period of 30 steps (~1 s) so the car can accelerate from a standing start.
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
-        stopped = (lin_vel_b < (0.025 * self._vel_cap)) & (self.episode_length_buf > 30)
+        stopped = (lin_vel_b < (0.02 * self._vel_cap)) & (self.episode_length_buf > 45)
 
         terminated = wall_terminated | flipped | slow_terminated | stopped
         time_out   = self.episode_length_buf >= self.max_episode_length - 1
@@ -1253,7 +1354,7 @@ class MushrMazeEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-        SPAWN_SPEED = 1.5   # m/s
+        SPAWN_SPEED = 2   # m/s
 
         fx, fy = self.cfg.fixed_spawn_pos
         diff         = self._sector_gates - torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device)
@@ -1286,8 +1387,7 @@ class MushrMazeEnv(DirectRLEnv):
             gate_idx = torch.randint(0, self._n_sectors, (nr,), device=self.device)
             spawn_xy[use_random] = self._sector_gates[gate_idx]
             gate_tan             = self._sector_tangents[gate_idx]
-            yaw_jitter           = (torch.rand(nr, device=self.device) - 0.5) * (2.0 * self.cfg.init_yaw_jitter)
-            yaw[use_random]      = torch.atan2(gate_tan[:, 1], gate_tan[:, 0]) + yaw_jitter
+            yaw[use_random]      = torch.atan2(gate_tan[:, 1], gate_tan[:, 0])
             self._current_sector[env_ids_t[use_random]] = gate_idx
 
         default_root_state[:, 0] = spawn_xy[:, 0]
@@ -1324,6 +1424,7 @@ class MushrMazeEnv(DirectRLEnv):
         # Seed velocity command to match the initial physics velocity so the integrator
         # doesn't immediately decelerate from 0 on the first step.
         self._current_vel[env_ids]    = SPAWN_SPEED
+        self._accel_m_s2[env_ids]     = 0.0
         self._filtered_steer[env_ids] = 0.0
         self._steer_integral[env_ids] = 0.0
         self._prev_steer[env_ids]     = 0.0

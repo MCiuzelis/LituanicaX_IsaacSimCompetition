@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import (
 @configclass
 class MushrMazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env: int = 64
-    max_iterations:    int = 3000
+    max_iterations:    int = 6000
     save_interval:     int = 40
     experiment_name:   str = "mushr_maze"
 
