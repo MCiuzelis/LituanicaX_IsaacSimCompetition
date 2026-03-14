@@ -158,7 +158,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.seed = seed
 
     # specify directory for logging experiments
-    log_root_path = os.path.join("/home/matasciuzelis/Documents/lituanicaXsim", "logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../logs", "rsl_rl", agent_cfg.experiment_name)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs: {time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

@@ -95,15 +95,21 @@ from .cone_vision import ConeVisionCfg, ConeVisionProcessor
 #NOTES: PER LETAI PRADEDA PRACIOJ PRADZIOJ, SUSTOJA, NUOLAT SWERVINA, NERA RACING LINES
 
 # ---------------------------------------------------------------------------
-# Asset USD paths
+# Asset USD paths  (relative to this file → project root → assets/)
 # ---------------------------------------------------------------------------
-MUSHR_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/mushr_nano_v2.usd"
+_ASSETS_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "../../../../../assets")
+)
 
-TRACK_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/CONES.usd"
+MUSHR_USD         = os.path.join(_ASSETS_DIR, "mushr_nano_v2.usd")
+TRACK_USD         = os.path.join(_ASSETS_DIR, "CONES.usd")
+WALL_USD          = os.path.join(_ASSETS_DIR, "WALLS.usd")
+# Simplified wall layout used during the initial training phase (before RAMP_ENABLE_LAPS laps).
+WALL_INITIAL_USD  = os.path.join(_ASSETS_DIR, "WALLS_INITIAL.usd")
+RAMP_USD          = os.path.join(_ASSETS_DIR, "RAMPS.usd")
 
-WALL_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/WALLS.usd"
-
-RAMP_USD = "/home/matasciuzelis/Documents/lituanicaXsim/assets/RAMPS.usd"
+# Number of total laps (across all envs) required before the ramp is enabled.
+RAMP_ENABLE_LAPS = 50
 
 # ---------------------------------------------------------------------------
 # Physical constants — MuSHR nano v2 (Ackermann / AWD)
@@ -119,8 +125,8 @@ BASE_WIDTH      = 0.2      # m  (track width between left/right wheels)
 # rolling mean episode return exceeds VEL_CAP_REWARD_THRESHOLD.
 # ---------------------------------------------------------------------------
 INITIAL_VEL_CAP = 3    # m/s — starting velocity ceiling
-VEL_CAP_MAX     = 6    # m/s — absolute maximum
-VEL_CAP_STEP    = 0.1  # m/s — increment per curriculum advancement
+VEL_CAP_MAX     = 3    # m/s — absolute maximum
+VEL_CAP_STEP    = 0.05  # m/s — increment per curriculum advancement
 
 # ---------------------------------------------------------------------------
 # Acceleration limits — AWD, full vehicle weight on all drive wheels.
@@ -523,9 +529,15 @@ class MushrMazeEnv(DirectRLEnv):
         # at the current vel_cap.  Consumed (and reset) in _reset_idx to advance vel_cap.
         self._lap_at_current_vel: bool = False
 
+        # ── Ramp curriculum state ─────────────────────────────────────────────────────
+        # Ramp starts disabled (invisible + no collision) and is enabled once
+        # RAMP_ENABLE_LAPS total laps have been completed across all envs.
+        self._total_laps_completed: int = 0
+        self._ramp_enabled: bool = False
+
         # ── Fixed → random spawn transition ───────────────────────────────────────────
-        # Starts False; set to True once mean episode return exceeds the threshold.
-        self._random_spawn_unlocked: bool = False
+        # Always random from the start.
+        self._random_spawn_unlocked: bool = True
         # Accumulates reward during each active episode [N] — reset to 0 at each reset.
         self._ep_return_buf = torch.zeros(self.num_envs, device=self.device)
         # Rolling window of completed episode returns used to compute the mean.
@@ -640,7 +652,7 @@ class MushrMazeEnv(DirectRLEnv):
             orientation=(0.0, 0.0, 0.0, 0.0),
         )
 
-        # 2b. Load the wall boundary with the same scale and orientation as the track.
+        # 2b. Load the full wall boundary — active after RAMP_ENABLE_LAPS laps.
         wall_cfg = sim_utils.UsdFileCfg(
             usd_path=WALL_USD,
             scale=(0.003, 0.003, 0.01),
@@ -648,6 +660,18 @@ class MushrMazeEnv(DirectRLEnv):
         wall_cfg.func(
             "/World/Walls",
             wall_cfg,
+            translation=(16, 0.0, 0.0),
+            orientation=(0.0, 0.0, 0.0, 0.0),
+        )
+
+        # 2b-ii. Load the initial (simpler) wall boundary — active from the start.
+        wall_initial_cfg = sim_utils.UsdFileCfg(
+            usd_path=WALL_INITIAL_USD,
+            scale=(0.003, 0.003, 0.01),
+        )
+        wall_initial_cfg.func(
+            "/World/WallsInitial",
+            wall_initial_cfg,
             translation=(16, 0.0, 0.0),
             orientation=(0.0, 0.0, 0.0, 0.0),
         )
@@ -660,14 +684,15 @@ class MushrMazeEnv(DirectRLEnv):
             import omni.usd
             from pxr import UsdPhysics, Usd
             stage = omni.usd.get_context().get_stage()
-            wall_root = stage.GetPrimAtPath("/World/Walls")
-            if wall_root.IsValid():
-                for prim in Usd.PrimRange(wall_root):
-                    if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
-                        UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Set("convexDecomposition")
-                    elif prim.HasAPI(UsdPhysics.CollisionAPI):
-                        mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
-                        mesh_api.GetApproximationAttr().Set("convexDecomposition")
+            for wall_path in ("/World/Walls", "/World/WallsInitial"):
+                wall_root = stage.GetPrimAtPath(wall_path)
+                if wall_root.IsValid():
+                    for prim in Usd.PrimRange(wall_root):
+                        if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
+                            UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Set("convexDecomposition")
+                        elif prim.HasAPI(UsdPhysics.CollisionAPI):
+                            mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                            mesh_api.GetApproximationAttr().Set("convexDecomposition")
         except Exception as e:
             print(f"[Wall] convexDecomposition setup failed: {e}")
 
@@ -708,38 +733,33 @@ class MushrMazeEnv(DirectRLEnv):
                 mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 mesh_collision.GetApproximationAttr().Set("convexHull")
 
-        # The walls are static colliders: enable collisions using triangle mesh geometry.
-        # They remain invisible to policy LiDAR because LiDAR targets only TrackMergedMesh.
-        wall_root = stage.GetPrimAtPath("/World/Walls")
-        if wall_root.IsValid():
+        # Apply CollisionAPI, kinematic RigidBodyAPI, and invisible to both wall prims.
+        # /World/Walls starts with collision DISABLED (active after RAMP_ENABLE_LAPS laps).
+        # /World/WallsInitial starts with collision ENABLED (active from the start).
+        for wall_path, collision_enabled in (
+            ("/World/Walls", False),
+            ("/World/WallsInitial", True),
+        ):
+            wall_root = stage.GetPrimAtPath(wall_path)
+            if not wall_root.IsValid():
+                continue
             for prim in Usd.PrimRange(wall_root):
                 if not prim.IsA(UsdGeom.Mesh):
                     continue
                 wall_collision = UsdPhysics.CollisionAPI.Apply(prim)
-                wall_collision.GetCollisionEnabledAttr().Set(True)
+                wall_collision.GetCollisionEnabledAttr().Set(collision_enabled)
                 wall_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 wall_mesh_collision.GetApproximationAttr().Set("none")
-
-        # Make the wall root a single kinematic rigid body so ContactSensor can track it.
-        # CollisionAPI is on child Mesh prims (e.g. /World/Walls/WallMesh_001), NOT on
-        # the root Xform.  filter_prim_paths_expr=["/World/Walls"] therefore matched no
-        # physics body, force_matrix_w was always empty, and wall contact was never
-        # detected via the sensor.  Applying RigidBodyAPI+kinematic to the root promotes
-        # it to a PhysX rigid body; PhysX automatically aggregates all descendant
-        # CollisionAPI shapes into it.  The filter now correctly matches /World/Walls.
-        if wall_root.IsValid():
+            # Kinematic rigid body on root so ContactSensor filter_prim_paths_expr matches.
             wall_rb = UsdPhysics.RigidBodyAPI.Apply(wall_root)
             wall_rb.GetRigidBodyEnabledAttr().Set(True)
             wall_rb.GetKinematicEnabledAttr().Set(True)
-
-        # Make walls invisible to all renderers (including the policy camera).
-        # Walls exist only for contact-force termination — PhysX collision detection
-        # is geometry-based and unaffected by UsdGeom visibility.
-        if wall_root.IsValid():
+            # Walls are always invisible to the policy camera.
             UsdGeom.Imageable(wall_root).MakeInvisible()
 
         # Enable triangle-mesh collision on ramp meshes so cars can drive on them.
-        # Ramps are kept VISIBLE — their purple color is a policy observation channel.
+        # Collision is applied here but immediately disabled below — the ramp starts
+        # inactive and is enabled after RAMP_ENABLE_LAPS total laps via _enable_ramp().
         ramp_root = stage.GetPrimAtPath("/World/Ramps")
         if ramp_root.IsValid():
             for prim in Usd.PrimRange(ramp_root):
@@ -749,6 +769,16 @@ class MushrMazeEnv(DirectRLEnv):
                 ramp_collision.GetCollisionEnabledAttr().Set(True)
                 ramp_mesh_col = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 ramp_mesh_col.GetApproximationAttr().Set("none")  # triangleMesh preserves ramp shape
+
+        # Ramp starts disabled: invisible and no collision.
+        if ramp_root.IsValid():
+            UsdGeom.Imageable(ramp_root).MakeInvisible()
+            for prim in Usd.PrimRange(ramp_root):
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                col_api = UsdPhysics.CollisionAPI(prim)
+                if col_api:
+                    col_api.GetCollisionEnabledAttr().Set(False)
 
 
         # Remove unsupported suspension drive gains from the imported USD joints.
@@ -797,7 +827,7 @@ class MushrMazeEnv(DirectRLEnv):
         for link_name in WALL_CONTACT_LINKS:
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
-                filter_prim_paths_expr=["/World/Walls"],
+                filter_prim_paths_expr=["/World/Walls", "/World/WallsInitial"],
                 history_length=self.cfg.decimation,
                 update_period=0.0,
                 track_pose=False,
@@ -876,6 +906,57 @@ class MushrMazeEnv(DirectRLEnv):
         # 9. Dome light
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    # ------------------------------------------------------------------
+    # Ramp enable helper
+    # ------------------------------------------------------------------
+
+    def _enable_ramp(self) -> None:
+        """Make the ramp visible and re-enable its collision after the lap threshold."""
+        try:
+            import omni.usd
+            from pxr import Usd, UsdGeom, UsdPhysics
+            stage = omni.usd.get_context().get_stage()
+            ramp_root = stage.GetPrimAtPath("/World/Ramps")
+            if ramp_root.IsValid():
+                UsdGeom.Imageable(ramp_root).MakeVisible()
+                for prim in Usd.PrimRange(ramp_root):
+                    if not prim.IsA(UsdGeom.Mesh):
+                        continue
+                    col_api = UsdPhysics.CollisionAPI(prim)
+                    if col_api:
+                        col_api.GetCollisionEnabledAttr().Set(True)
+                print(f"[Ramp] ENABLED after {self._total_laps_completed} total laps!")
+        except Exception as e:
+            print(f"[Ramp] Enable failed: {e}")
+
+    def _swap_walls(self) -> None:
+        """Swap from WALLS_INITIAL to WALLS after the lap threshold is reached."""
+        try:
+            import omni.usd
+            from pxr import Usd, UsdGeom, UsdPhysics
+            stage = omni.usd.get_context().get_stage()
+            # Disable collision on the initial walls.
+            initial_root = stage.GetPrimAtPath("/World/WallsInitial")
+            if initial_root.IsValid():
+                for prim in Usd.PrimRange(initial_root):
+                    if not prim.IsA(UsdGeom.Mesh):
+                        continue
+                    col_api = UsdPhysics.CollisionAPI(prim)
+                    if col_api:
+                        col_api.GetCollisionEnabledAttr().Set(False)
+            # Enable collision on the full walls.
+            full_root = stage.GetPrimAtPath("/World/Walls")
+            if full_root.IsValid():
+                for prim in Usd.PrimRange(full_root):
+                    if not prim.IsA(UsdGeom.Mesh):
+                        continue
+                    col_api = UsdPhysics.CollisionAPI(prim)
+                    if col_api:
+                        col_api.GetCollisionEnabledAttr().Set(True)
+            print(f"[Walls] Swapped to WALLS.usd after {self._total_laps_completed} total laps!")
+        except Exception as e:
+            print(f"[Walls] Swap failed: {e}")
 
     # ------------------------------------------------------------------
     # Step hooks
@@ -1090,6 +1171,13 @@ class MushrMazeEnv(DirectRLEnv):
                 if fresh_lap.any() and not self._lap_at_current_vel:
                     self._lap_at_current_vel = True
 
+                # Ramp/wall curriculum: count total laps and trigger once threshold is reached.
+                self._total_laps_completed += int(lap_agents.sum().item())
+                if not self._ramp_enabled and self._total_laps_completed >= RAMP_ENABLE_LAPS:
+                    self._ramp_enabled = True
+                    self._enable_ramp()
+                    self._swap_walls()
+
         if not self._reference_established:
             r_sector = torch.zeros(self.num_envs, device=self.device)
         else:
@@ -1184,7 +1272,7 @@ class MushrMazeEnv(DirectRLEnv):
 
         # Ramp detection via Z position — reliable and sensor-filter-independent.
         # Flat ground z ~ 0.02 m; ramp raises robot above ramp_ground_z immediately.
-        self._on_ramp = self.robot.data.root_pos_w[:, 2] >= self.cfg.ramp_ground_z
+        self._on_ramp = self.robot.data.root_pos_w[:, 2] >= 0.001
 
         # Sticky flag persists until _reset_idx clears it.
         self._wall_ever_touched |= wall_terminated
@@ -1263,13 +1351,8 @@ class MushrMazeEnv(DirectRLEnv):
 
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)  # [n]
 
-        # Determine which of the n resetting envs get fixed vs random spawn.
-        # Phase 1 (not unlocked): all fixed.
-        # Phase 2 (unlocked):     50% fixed, 50% random CSV-gate.
-        if self._random_spawn_unlocked:
-            use_random = torch.rand(n, device=self.device) < 0.5          # [n] bool
-        else:
-            use_random = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # All agents always spawn randomly at a CSV gate position.
+        use_random = torch.ones(n, dtype=torch.bool, device=self.device)
 
         spawn_xy = torch.empty(n, 2, device=self.device)
         yaw      = torch.empty(n,    device=self.device)
