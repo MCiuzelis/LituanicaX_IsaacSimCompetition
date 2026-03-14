@@ -118,7 +118,7 @@ BASE_WIDTH      = 0.2      # m  (track width between left/right wheels)
 # vel_cap starts at INITIAL_VEL_CAP and advances toward VEL_CAP_MAX as the
 # rolling mean episode return exceeds VEL_CAP_REWARD_THRESHOLD.
 # ---------------------------------------------------------------------------
-INITIAL_VEL_CAP = 3.5    # m/s — starting velocity ceiling
+INITIAL_VEL_CAP = 3    # m/s — starting velocity ceiling
 VEL_CAP_MAX     = 6    # m/s — absolute maximum
 VEL_CAP_STEP    = 0.1  # m/s — increment per curriculum advancement
 
@@ -180,13 +180,7 @@ WALL_CONTACT_FORCE_THRESH = 0.0   # N
 # Ramp contact detection uses a lower horizontal-force threshold so shallow ramp
 # normals are still picked up while flat-ground contacts remain filtered out.
 
-
-# Slow-driving penalty and termination.
-# Any step where forward speed < SLOW_SPEED_FRACTION × vel_cap counts toward the
-# slow timer.  The timer resets to 0 the moment speed rises above the threshold.
-# Terminate if the timer reaches SLOW_TIMEOUT_STEPS (6 s × 30 Hz = 180 steps).
-SLOW_SPEED_FRACTION = 0.3 #0.1    # fraction of vel_cap below which the robot is "too slow"
-SLOW_TIMEOUT_STEPS  = 9999    # 6 s × 30 Hz
+SLOW_SPEED_FRACTION = 0.3
 
 # Robot links monitored for wall contact.
 WALL_CONTACT_LINKS = (
@@ -377,54 +371,20 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     #   reward = sector_gain_weight * (ref_time - sector_time) / ref_time
     sector_gain_weight: float = 50.0
 
-    # Quick-start bonus: one-time reward for quickly departing the spawn zone.
-    # Reward = start_bonus_weight * (1 - step_count / start_bonus_horizon), clamped ≥ 0.
-    # Full reward if the car leaves start_departure_dist metres from spawn in 1 step;
-    # zero if it takes start_bonus_horizon steps or more.
-    start_bonus_weight:    float = 100.0
-    start_departure_dist:  float = 2.0   # metres from spawn to count as "departed"
-    start_bonus_horizon:   int   = 90    # steps — reward linearly decays to 0 by this step
-
     # Rear-wheel slip penalty: discourages wheel-locking hard braking.
     # slip_speed = |mean_rear_wheel_tangential_vel − body_forward_vel| / MAX_LIN_VEL
     slip_weight:        float = 4.0
-
-    # Forward acceleration reward: per-step bonus when commanded acceleration is positive.
-    # Reward = accel_reward_weight * clamp(accel_m_s2 / MAX_ACCEL, 0, 1).
-    accel_reward_weight: float = 0
-
-    # Steering oscillation penalty: high-pass filter that penalises rapid steering changes.
-    # Each step the running state is updated:
-    #   d_steer = |filtered_steer[t] - filtered_steer[t-1]|  (absolute change per step)
-    #   _steer_integral = (1 - alpha) * _steer_integral + alpha * d_steer
-    # This is an EMA of the steering *derivative* — it grows when inputs change quickly
-    # (many rapid corrections) and stays near zero when steering is held steady or
-    # adjusted only gradually.  Penalty = -steer_integral_weight * _steer_integral.
-    # alpha controls decay speed: alpha=0.3 → ~2-step half-life (fast decay when calm).
-    steer_integral_weight: float = 0   # penalty weight
-    steer_integral_alpha:  float = 0.6
 
     # Steering magnitude penalty using a fifth-root curve.
     # reward = steer_shape_weight * (|steer_angle| / MAX_STEER)^(1/5)
     # The fifth root is concave — it strongly penalises even small steering angles
     # while the penalty saturates gently at large angles.
     # Set negative to penalise; set to 0.0 to disable.
-    steer_shape_weight: float = 7
+    steer_shape_weight: float = 0.5
 
     # Ramp reward: per-step bonus while any robot link contacts the ramp AND forward vel > 0.
     # Reward = ramp_reward_weight * clamp(v_fwd / INITIAL_VEL_CAP, 0, 1) per step on ramp.
-    ramp_reward_weight: float = 0
-
-    # Ramp completion reward: one-time fixed bonus for a full ramp traversal.
-    # Awarded when the agent reaches z >= ramp_top_z (while touching the ramp) and
-    # then descends back to z < ramp_ground_z (no ramp contact required on landing).
-    ramp_completion_reward: float = 0.0
-    ramp_top_z:             float = 1.5    # m — height threshold for "topped the ramp"
-    ramp_ground_z:          float = 0.07   # m — height threshold for "back on ground"
-
-    # Height reward: per-step bonus proportional to z height.
-    # Reward = height_reward_weight * clamp(z / ramp_top_z, 0, 1).
-    height_reward_weight: float = 3
+    ramp_reward_weight: float = 3
 
     # Slow-driving penalty: applied every step the robot is below SLOW_SPEED_FRACTION × vel_cap.
     slow_penalty_weight: float = 2 #3.0
@@ -435,7 +395,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # after which random CSV-gate spawning is used for the rest of training.
     fixed_spawn_pos:              tuple = (15.239, 5)   # world XY (Z taken from USD default)
     fixed_spawn_yaw:              float = -math.pi / 2.0     # -90° = facing negative Y (track direction)
-    fixed_spawn_reward_threshold: float = 600.0              # mean episode return to unlock random spawning
+    fixed_spawn_reward_threshold: float = 10.0              # mean episode return to unlock random spawning
     fixed_spawn_history_len:      int   = 50                # rolling window size (episodes)
 
     # Low-pass filter (EMA) for steering — simulates servo bandwidth (~100 ms).
@@ -628,8 +588,6 @@ class MushrMazeEnv(DirectRLEnv):
         # Spawn XY position for each env (set at reset, used for start-bonus distance check)
         self._spawn_pos = torch.zeros(self.num_envs, 2, device=self.device)
         # Whether the one-time start bonus has been given for each env this episode
-        self._start_bonus_given = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
 
         # Termination/contact flags — set in _get_dones, read in _get_rewards
         self._wall_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1063,21 +1021,9 @@ class MushrMazeEnv(DirectRLEnv):
         # Wall termination penalty.
         r_wall = -self.cfg.wall_penalty * self._wall_terminated.float()
 
-        # ── Quick-start bonus ─────────────────────────────────────────────────────────
-        # One-time reward for quickly leaving the spawn zone.
-        # Decays linearly from start_bonus_weight (step 1) to 0 (step start_bonus_horizon).
+
         pos_xy = self.robot.data.root_pos_w[:, :2]                          # [N, 2]
-        dist_from_spawn = torch.linalg.vector_norm(
-            pos_xy - self._spawn_pos, dim=-1
-        )
-        departed_now = (~self._start_bonus_given) & (
-            dist_from_spawn > self.cfg.start_departure_dist
-        )
-        time_fraction = (
-            self.episode_length_buf.float() / self.cfg.start_bonus_horizon
-        ).clamp(0.0, 1.0)
-        r_start = self.cfg.start_bonus_weight * departed_now.float() * (1.0 - time_fraction)
-        self._start_bonus_given |= departed_now
+
 
         # ── Sector timing reward ──────────────────────────────────────────────────────
         # Two-phase system:
@@ -1169,29 +1115,6 @@ class MushrMazeEnv(DirectRLEnv):
         slip_speed   = torch.abs(wheel_vel - lin_vel_b)                           # [N] m/s
         r_slip       = -self.cfg.slip_weight * slip_speed / INITIAL_VEL_CAP
 
-        # ── Forward acceleration reward ─────────────────────────────────────────────
-        r_accel = self.cfg.accel_reward_weight * (self._accel_m_s2 / MAX_ACCEL).clamp(min=0.0, max=1.0)
-
-        # # ── Steering oscillation penalty (high-pass) ─────────────────────────────────
-        # # d_steer = per-step absolute change in steering (rad); large when the agent
-        # # reverses or jerks the wheel quickly, near-zero on steady holds or slow sweeps.
-        # # The EMA smooths out single-frame spikes while accumulating rapid back-and-forth.
-        # d_steer = torch.abs(self._filtered_steer - self._prev_steer) * MAX_STEER  # [N] rad
-        # alpha = self.cfg.steer_integral_alpha
-        # self._steer_integral = (1.0 - alpha) * self._steer_integral + alpha * d_steer
-        # self._prev_steer = self._filtered_steer.clone()
-        # r_steer = -self.cfg.steer_integral_weight * self._steer_integral
-        x = self._filtered_steer * MAX_STEER        # x[n]
-        prev_x = self._prev_steer * MAX_STEER       # x[n-1]
-
-        # High-pass filter
-        self._steer_hp = self.cfg.steer_integral_alpha * (self._steer_hp + x - prev_x)
-
-        # store previous input
-        self._prev_steer = self._filtered_steer.clone()
-
-        # reward
-        r_steer = -self.cfg.steer_integral_weight * torch.abs(self._steer_hp)
 
         # ── Steering magnitude penalty (fifth-root curve) ─────────────────────────────
         # (|steer_angle| / MAX_STEER)^(1/5) is concave: penalises small angles
@@ -1209,19 +1132,7 @@ class MushrMazeEnv(DirectRLEnv):
         # low_roll = grav_y.abs() < 0.0872                                    # sin(5°) ≈ 0.0872
         r_ramp = self.cfg.ramp_reward_weight * self._on_ramp.float() * (lin_vel_b / INITIAL_VEL_CAP).clamp(0.0, 1.0)
 
-        # ── Ramp completion reward ────────────────────────────────────────────────────
-        # State machine: set _ramp_ascended when agent reaches ramp_top_z while on_ramp;
-        # fire one-time reward (and reset flag) when agent then drops below ramp_ground_z.
-        pos_z = self.robot.data.root_pos_w[:, 2]                            # [N]
-        topped = (~self._ramp_ascended) & self._on_ramp & (pos_z >= self.cfg.ramp_top_z)
-        self._ramp_ascended |= topped
-        landed = self._ramp_ascended & (pos_z < self.cfg.ramp_ground_z)
-        self._ramp_ascended &= ~landed                                       # reset flag
-        r_ramp_complete = self.cfg.ramp_completion_reward * landed.float()
-
-        # ── Height reward ────────────────────────────────────────────────────────────
-        r_height = self.cfg.height_reward_weight * (pos_z.clamp(0.0, self.cfg.ramp_top_z) / self.cfg.ramp_top_z).clamp(0.0, 1.0)
-
+        
         # ── Slow-driving penalty ─────────────────────────────────────────────────────
         # Suppressed while on the ramp — the car naturally slows on inclines.
         is_slow = (lin_vel_b < (SLOW_SPEED_FRACTION * self._vel_cap)) & ~self._on_ramp
@@ -1236,16 +1147,11 @@ class MushrMazeEnv(DirectRLEnv):
             r_distance
             + r_forward
             + r_slip
-            + r_accel
-            + r_height
-            + r_steer
             + r_steer_shape
             + r_slow
             + r_wall
             + r_sector
-            + r_start
             + r_ramp
-            + r_ramp_complete
         )
 
         # Accumulate per-episode return for fixed→random spawn threshold check.
@@ -1296,17 +1202,12 @@ class MushrMazeEnv(DirectRLEnv):
         up_z = 1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])
         flipped = up_z < 0.3
 
-        # Slow-driving termination: _slow_timer is updated in _get_rewards each step.
-        # Terminate if the robot has been continuously below the speed threshold for
-        # SLOW_TIMEOUT_STEPS steps (6 s at 30 Hz).
-        slow_terminated = self._slow_timer >= SLOW_TIMEOUT_STEPS
-
         # Near-stop termination: immediate termination if speed drops below 5 % of vel_cap.
         # Grace period of 30 steps (~1 s) so the car can accelerate from a standing start.
         lin_vel_b = self.robot.data.root_lin_vel_b[:, 0]
         stopped = (lin_vel_b < (0.02 * self._vel_cap)) & (self.episode_length_buf > 45)
 
-        terminated = wall_terminated | flipped | slow_terminated | stopped
+        terminated = wall_terminated | flipped | stopped
         time_out   = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
 
@@ -1407,7 +1308,6 @@ class MushrMazeEnv(DirectRLEnv):
 
         # ── Sector + quick-start + steering state reset ──────────────────────────────
         self._spawn_pos[env_ids]              = spawn_xy
-        self._start_bonus_given[env_ids]      = False
         self._sectors_this_ep[env_ids]        = 0
         self._agent_spawn_vel_cap[env_ids]    = self._vel_cap
 
