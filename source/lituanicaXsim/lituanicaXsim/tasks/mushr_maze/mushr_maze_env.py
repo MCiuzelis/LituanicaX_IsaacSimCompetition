@@ -365,17 +365,17 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # summing to total odometry over the episode.  Works correctly on a circular track
     # because it integrates incremental progress rather than straight-line displacement.
     distance_weight:    float = 3   # reward per metre of forward travel
-    forward_weight:     float = 3
+    forward_weight:     float = 1.5
 
     # Extra one-time penalty specifically for wall contact (on top of collision_penalty).
-    wall_penalty:       float = 100
+    wall_penalty:       float = 200
 
     # Sector timing reward.
     # No reward is given until ALL sectors have been crossed at least once, building a
     # reference lap (best time per sector seen so far).  Once the reference is set,
     # any subsequent crossing that beats the reference time earns:
     #   reward = sector_gain_weight * (ref_time - sector_time) / ref_time
-    sector_gain_weight: float = 50.0
+    sector_gain_weight: float = 10.0
 
     # Rear-wheel slip penalty: discourages wheel-locking hard braking.
     # slip_speed = |mean_rear_wheel_tangential_vel − body_forward_vel| / MAX_LIN_VEL
@@ -386,7 +386,10 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # The fifth root is concave — it strongly penalises even small steering angles
     # while the penalty saturates gently at large angles.
     # Set negative to penalise; set to 0.0 to disable.
-    steer_shape_weight: float = 0.5
+    steer_shape_weight: float = 2
+
+    # One-time bonus awarded the moment an agent completes a full lap.
+    lap_completion_reward: float = 500.0
 
     # Ramp reward: per-step bonus while any robot link contacts the ramp AND forward vel > 0.
     # Reward = ramp_reward_weight * clamp(v_fwd / INITIAL_VEL_CAP, 0, 1) per step on ramp.
@@ -1132,6 +1135,10 @@ class MushrMazeEnv(DirectRLEnv):
             (self.episode_length_buf - self._sector_entry_step).float() * dt_policy
         )                                                                   # [N]
 
+        # lap_agents is set inside the crossed.any() block; initialise here so r_lap
+        # is always defined even on steps where no gate is crossed.
+        lap_agents = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # Always track per-env crossing count (used for both reference and curriculum)
         if crossed.any():
             crossed_sectors = next_gate[crossed]                            # [K]
@@ -1156,6 +1163,19 @@ class MushrMazeEnv(DirectRLEnv):
                 # Reset counters immediately so each lap fires exactly once
                 self._sectors_this_ep[lap_agents] = 0
 
+                # Count laps first so the print shows the correct running total.
+                self._total_laps_completed += int(lap_agents.sum().item())
+
+                # Print each lap completion with env id, episode time, and running total.
+                for eid in lap_agents.nonzero(as_tuple=False).squeeze(-1).tolist():
+                    ep_steps = int(self.episode_length_buf[eid].item())
+                    lap_time_s = ep_steps * self.cfg.decimation * self.cfg.sim.dt
+                    print(
+                        f"[Lap] env={eid:>3d}  step={ep_steps:>6d}  "
+                        f"time={lap_time_s:.1f}s  "
+                        f"total_laps={self._total_laps_completed}"
+                    )
+
                 if not self._reference_established:
                     self._sector_reference_times = self._sector_best_times.clone()
                     self._reference_established = True
@@ -1171,12 +1191,15 @@ class MushrMazeEnv(DirectRLEnv):
                 if fresh_lap.any() and not self._lap_at_current_vel:
                     self._lap_at_current_vel = True
 
-                # Ramp/wall curriculum: count total laps and trigger once threshold is reached.
-                self._total_laps_completed += int(lap_agents.sum().item())
+                # Ramp/wall curriculum: trigger once threshold is reached.
                 if not self._ramp_enabled and self._total_laps_completed >= RAMP_ENABLE_LAPS:
                     self._ramp_enabled = True
                     self._enable_ramp()
                     self._swap_walls()
+
+        # ── Lap completion bonus ───────────────────────────────────────────────────────
+        r_lap = torch.zeros(self.num_envs, device=self.device)
+        r_lap[lap_agents] = self.cfg.lap_completion_reward
 
         if not self._reference_established:
             r_sector = torch.zeros(self.num_envs, device=self.device)
@@ -1240,6 +1263,7 @@ class MushrMazeEnv(DirectRLEnv):
             + r_wall
             + r_sector
             + r_ramp
+            + r_lap
         )
 
         # Accumulate per-episode return for fixed→random spawn threshold check.
