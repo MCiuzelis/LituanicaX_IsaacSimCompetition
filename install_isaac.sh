@@ -28,20 +28,6 @@ echo ""
 echo "Installing system dependencies..."
 apt update
 apt install -y 
-curl 
-git 
-build-essential 
-cmake 
-ninja-build 
-python${PYTHON_VERSION} 
-python${PYTHON_VERSION}-venv 
-python${PYTHON_VERSION}-dev 
-libglib2.0-0 
-libsm6 
-libxext6 
-libxrender1 
-libgl1 
-libegl1
 
 echo ""
 echo "Installing uv..."
