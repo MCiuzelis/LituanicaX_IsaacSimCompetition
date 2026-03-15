@@ -124,8 +124,8 @@ BASE_WIDTH      = 0.2      # m  (track width between left/right wheels)
 # vel_cap starts at INITIAL_VEL_CAP and advances toward VEL_CAP_MAX as the
 # rolling mean episode return exceeds VEL_CAP_REWARD_THRESHOLD.
 # ---------------------------------------------------------------------------
-INITIAL_VEL_CAP = 3    # m/s — starting velocity ceiling
-VEL_CAP_MAX     = 3    # m/s — absolute maximum
+INITIAL_VEL_CAP = 2.5    # m/s — starting velocity ceiling
+VEL_CAP_MAX     = 2.5    # m/s — absolute maximum
 VEL_CAP_STEP    = 0.05  # m/s — increment per curriculum advancement
 
 # ---------------------------------------------------------------------------
@@ -368,7 +368,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     forward_weight:     float = 1.5
 
     # Extra one-time penalty specifically for wall contact (on top of collision_penalty).
-    wall_penalty:       float = 200
+    wall_penalty:       float = 100
 
     # Sector timing reward.
     # No reward is given until ALL sectors have been crossed at least once, building a
@@ -386,7 +386,7 @@ class MushrMazeEnvCfg(DirectRLEnvCfg):
     # The fifth root is concave — it strongly penalises even small steering angles
     # while the penalty saturates gently at large angles.
     # Set negative to penalise; set to 0.0 to disable.
-    steer_shape_weight: float = 2
+    steer_shape_weight: float = 4
 
     # One-time bonus awarded the moment an agent completes a full lap.
     lap_completion_reward: float = 500.0
@@ -533,10 +533,9 @@ class MushrMazeEnv(DirectRLEnv):
         self._lap_at_current_vel: bool = False
 
         # ── Ramp curriculum state ─────────────────────────────────────────────────────
-        # Ramp starts disabled (invisible + no collision) and is enabled once
-        # RAMP_ENABLE_LAPS total laps have been completed across all envs.
+        # Ramp is enabled from the start (no lap threshold).
         self._total_laps_completed: int = 0
-        self._ramp_enabled: bool = False
+        self._ramp_enabled: bool = True
 
         # ── Fixed → random spawn transition ───────────────────────────────────────────
         # Always random from the start.
@@ -655,7 +654,7 @@ class MushrMazeEnv(DirectRLEnv):
             orientation=(0.0, 0.0, 0.0, 0.0),
         )
 
-        # 2b. Load the full wall boundary — active after RAMP_ENABLE_LAPS laps.
+        # 2b. Load the full wall boundary — active from the start.
         wall_cfg = sim_utils.UsdFileCfg(
             usd_path=WALL_USD,
             scale=(0.003, 0.003, 0.01),
@@ -663,18 +662,6 @@ class MushrMazeEnv(DirectRLEnv):
         wall_cfg.func(
             "/World/Walls",
             wall_cfg,
-            translation=(16, 0.0, 0.0),
-            orientation=(0.0, 0.0, 0.0, 0.0),
-        )
-
-        # 2b-ii. Load the initial (simpler) wall boundary — active from the start.
-        wall_initial_cfg = sim_utils.UsdFileCfg(
-            usd_path=WALL_INITIAL_USD,
-            scale=(0.003, 0.003, 0.01),
-        )
-        wall_initial_cfg.func(
-            "/World/WallsInitial",
-            wall_initial_cfg,
             translation=(16, 0.0, 0.0),
             orientation=(0.0, 0.0, 0.0, 0.0),
         )
@@ -687,7 +674,7 @@ class MushrMazeEnv(DirectRLEnv):
             import omni.usd
             from pxr import UsdPhysics, Usd
             stage = omni.usd.get_context().get_stage()
-            for wall_path in ("/World/Walls", "/World/WallsInitial"):
+            for wall_path in ("/World/Walls",):
                 wall_root = stage.GetPrimAtPath(wall_path)
                 if wall_root.IsValid():
                     for prim in Usd.PrimRange(wall_root):
@@ -738,10 +725,9 @@ class MushrMazeEnv(DirectRLEnv):
 
         # Apply CollisionAPI, kinematic RigidBodyAPI, and invisible to both wall prims.
         # /World/Walls starts with collision DISABLED (active after RAMP_ENABLE_LAPS laps).
-        # /World/WallsInitial starts with collision ENABLED (active from the start).
+        # /World/Walls has collision ENABLED from the start.
         for wall_path, collision_enabled in (
-            ("/World/Walls", False),
-            ("/World/WallsInitial", True),
+            ("/World/Walls", True),
         ):
             wall_root = stage.GetPrimAtPath(wall_path)
             if not wall_root.IsValid():
@@ -760,11 +746,10 @@ class MushrMazeEnv(DirectRLEnv):
             # Walls are always invisible to the policy camera.
             UsdGeom.Imageable(wall_root).MakeInvisible()
 
-        # Enable triangle-mesh collision on ramp meshes so cars can drive on them.
-        # Collision is applied here but immediately disabled below — the ramp starts
-        # inactive and is enabled after RAMP_ENABLE_LAPS total laps via _enable_ramp().
+        # Enable triangle-mesh collision on ramp meshes — ramp is active from the start.
         ramp_root = stage.GetPrimAtPath("/World/Ramps")
         if ramp_root.IsValid():
+            UsdGeom.Imageable(ramp_root).MakeVisible()
             for prim in Usd.PrimRange(ramp_root):
                 if not prim.IsA(UsdGeom.Mesh):
                     continue
@@ -772,16 +757,6 @@ class MushrMazeEnv(DirectRLEnv):
                 ramp_collision.GetCollisionEnabledAttr().Set(True)
                 ramp_mesh_col = UsdPhysics.MeshCollisionAPI.Apply(prim)
                 ramp_mesh_col.GetApproximationAttr().Set("none")  # triangleMesh preserves ramp shape
-
-        # Ramp starts disabled: invisible and no collision.
-        if ramp_root.IsValid():
-            UsdGeom.Imageable(ramp_root).MakeInvisible()
-            for prim in Usd.PrimRange(ramp_root):
-                if not prim.IsA(UsdGeom.Mesh):
-                    continue
-                col_api = UsdPhysics.CollisionAPI(prim)
-                if col_api:
-                    col_api.GetCollisionEnabledAttr().Set(False)
 
 
         # Remove unsupported suspension drive gains from the imported USD joints.
@@ -830,7 +805,7 @@ class MushrMazeEnv(DirectRLEnv):
         for link_name in WALL_CONTACT_LINKS:
             sensor_cfg = ContactSensorCfg(
                 prim_path=f"/World/envs/env_.*/Robot/mushr_nano/{link_name}",
-                filter_prim_paths_expr=["/World/Walls", "/World/WallsInitial"],
+                filter_prim_paths_expr=["/World/Walls"],
                 history_length=self.cfg.decimation,
                 update_period=0.0,
                 track_pose=False,
@@ -1191,11 +1166,11 @@ class MushrMazeEnv(DirectRLEnv):
                 if fresh_lap.any() and not self._lap_at_current_vel:
                     self._lap_at_current_vel = True
 
-                # Ramp/wall curriculum: trigger once threshold is reached.
-                if not self._ramp_enabled and self._total_laps_completed >= RAMP_ENABLE_LAPS:
-                    self._ramp_enabled = True
-                    self._enable_ramp()
-                    self._swap_walls()
+                # Ramp/wall curriculum: disabled — ramp is active from the start.
+                # if not self._ramp_enabled and self._total_laps_completed >= RAMP_ENABLE_LAPS:
+                #     self._ramp_enabled = True
+                #     self._enable_ramp()
+                #     # self._swap_walls()  # WALLS.usd is active from the start; no swap needed
 
         # ── Lap completion bonus ───────────────────────────────────────────────────────
         r_lap = torch.zeros(self.num_envs, device=self.device)
@@ -1375,31 +1350,36 @@ class MushrMazeEnv(DirectRLEnv):
 
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)  # [n]
 
-        # All agents always spawn randomly at a CSV gate position.
-        use_random = torch.ones(n, dtype=torch.bool, device=self.device)
-
         spawn_xy = torch.empty(n, 2, device=self.device)
         yaw      = torch.empty(n,    device=self.device)
 
-        # ── Fixed-spawn slots ─────────────────────────────────────────────────
-        fixed_mask = ~use_random
-        if fixed_mask.any():
-            nf = fixed_mask.sum()
-            spawn_xy[fixed_mask] = torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device).expand(nf, -1)
-            yaw[fixed_mask]      = self.cfg.fixed_spawn_yaw
-            self._current_sector[env_ids_t[fixed_mask]] = fixed_nearest_gate
+        # ── Fixed spawn: all agents at (15.15, 6.06, 0.002) ──────────────────
+        FIXED_SPAWN_X = 15.15
+        FIXED_SPAWN_Y = 6.06
+        FIXED_SPAWN_Z = 0.002
+        spawn_xy[:] = torch.tensor([[FIXED_SPAWN_X, FIXED_SPAWN_Y]], dtype=torch.float32, device=self.device)
+        yaw[:]      = self.cfg.fixed_spawn_yaw
+        self._current_sector[env_ids_t] = fixed_nearest_gate
 
-        # ── Random CSV-gate slots ─────────────────────────────────────────────
-        if use_random.any():
-            nr       = use_random.sum()
-            gate_idx = torch.randint(0, self._n_sectors, (nr,), device=self.device)
-            spawn_xy[use_random] = self._sector_gates[gate_idx]
-            gate_tan             = self._sector_tangents[gate_idx]
-            yaw[use_random]      = torch.atan2(gate_tan[:, 1], gate_tan[:, 0])
-            self._current_sector[env_ids_t[use_random]] = gate_idx
+        # ── Random CSV-gate spawning (commented out — re-enable to use multi-spawn curriculum) ──
+        # use_random = torch.ones(n, dtype=torch.bool, device=self.device)
+        # fixed_mask = ~use_random
+        # if fixed_mask.any():
+        #     nf = fixed_mask.sum()
+        #     spawn_xy[fixed_mask] = torch.tensor([[fx, fy]], dtype=torch.float32, device=self.device).expand(nf, -1)
+        #     yaw[fixed_mask]      = self.cfg.fixed_spawn_yaw
+        #     self._current_sector[env_ids_t[fixed_mask]] = fixed_nearest_gate
+        # if use_random.any():
+        #     nr       = use_random.sum()
+        #     gate_idx = torch.randint(0, self._n_sectors, (nr,), device=self.device)
+        #     spawn_xy[use_random] = self._sector_gates[gate_idx]
+        #     gate_tan             = self._sector_tangents[gate_idx]
+        #     yaw[use_random]      = torch.atan2(gate_tan[:, 1], gate_tan[:, 0])
+        #     self._current_sector[env_ids_t[use_random]] = gate_idx
 
         default_root_state[:, 0] = spawn_xy[:, 0]
         default_root_state[:, 1] = spawn_xy[:, 1]
+        default_root_state[:, 2] = FIXED_SPAWN_Z
 
         zeros = torch.zeros(n, device=self.device)
         dq = quat_from_euler_xyz(zeros, zeros, yaw)
